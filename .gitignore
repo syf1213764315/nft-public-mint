@@ -1,0 +1,20 @@
+# deps & build
+node_modules/
+dist/
+osnm-z/target/
+osnm-z/Cargo.lock
+
+# secrets & local state
+.env
+.env.*
+*.pem
+*.key
+wallets.json
+wallets*.json
+!wallets.example.json
+osnm-z/wallets*.json
+osnm-z/*.session
+
+# os
+.DS_Store
+*.log
