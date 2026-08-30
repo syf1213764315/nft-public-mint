@@ -18,3 +18,5 @@ osnm-z/*.session
 # os
 .DS_Store
 *.log
+__pycache__/
+*.pyc
