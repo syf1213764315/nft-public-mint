@@ -17,6 +17,7 @@ import {
   privateRpcsFromEnv,
   resolveRpcsForChain,
   toRpcUrl,
+  verifyChainId,
 } from "./rpc-resolver";
 import { parseRpcEndpoints } from "./rpc-blast";
 import { buildLocalMintPlan, LocalMintPlan } from "./seadrop-public";
@@ -81,6 +82,22 @@ export async function runWizard(): Promise<void> {
     throw new Error(`No usable RPC endpoint for ${chainProfile.name}`);
   }
   if (!plan.verified) {
+    // H1: cross-check the first accepted endpoint's chainId explicitly.
+    // Send-only endpoints (no eth_chainId response) are kept with a warning;
+    // a live endpoint that reports a DIFFERENT chain than selected is a hard
+    // error — signing with it would send a tx to the wrong network.
+    const actualChainId = await verifyChainId(plan.urls[0]);
+    if (actualChainId !== null && actualChainId !== chainProfile.chainId) {
+      const wrong = resolveChain(actualChainId);
+      throw new Error(
+        `Chain mismatch: selected ${chainProfile.name} (${chainProfile.chainId}) but RPC endpoint ${plan.urls[0]} reports ` +
+          `chain ${actualChainId}${wrong ? ` (${wrong.name})` : ""}. ` +
+          "Refusing to sign against the wrong network. Use the correct RPC URL for your selected chain."
+      );
+    }
+    // No endpoint confirmed the expected chain id, but the first URL is either
+    // a send-only endpoint (no eth_chainId response) or unreachable — keep with
+    // a warning.
     console.log(chalk.yellow(`  ⚠ No endpoint confirmed chain id ${chainProfile.chainId}.`));
     if (!(await askYesNo("Continue anyway?", false))) {
       throw new Error("Aborted — could not verify the RPC chain");

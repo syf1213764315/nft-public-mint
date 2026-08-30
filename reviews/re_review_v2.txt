@@ -1,0 +1,95 @@
+HTTP 200
+# Verification Report â safe_mint.py (nft-public-mint)
+
+## Verification of Prior Findings
+
+| # | Finding | Status | Evidence |
+|---|---------|--------|----------|
+| 1 | keccak vs sha3_256 | **VERIFIED-FIXED** | `keccak()` helper via `eth_hash.auto` (L65â72); used in `abi_encode_call`/`parse_function_call` selectors (L478, L524), `checksum_address` (L455), `broadcast_same_raw` dedup hash (L386). No `hashlib.sha3_256` import remains. |
+| 2 | "nonce too low" fake success | **VERIFIED-FIXED** | L373â380 raises `SafeMintError`; only `already known`/`known transaction` returns deterministic keccak hash. |
+| 3 | PublicDrop ABI decode | **VERIFIED-FIXED (maintainer correct)** | Confirmed against public SeaDrop (`seadrop/contracts/lib/PublicDrop.sol`): ABI tuple `(mintPrice uint80, startTime uint48, endTime uint48, maxTotalMintableByWallet uint16, feeBps uint16, restrictFeeRecipients bool)` â all uintN â¤ 256 â ABI-encoded as 5 separate 32-byte words. `decode_uint256(result, 0..4)` is correct. The 6th field (`restrictFeeRecipients`) is intentionally not read. |
+| 4 | FAILED-state lockout | **VERIFIED-FIXED** | L649: `state IN ('BROADCAST','CONFIRMED')` â FAILED excluded, retry allowed. |
+| 5 | RPCPool ranking cache + cross-endpoint nonce/gas | **VERIFIED-FIXED** | `invalidate()` (L289â293) + `best_client()` (L295â302) pin fire-time reads. L796â808 calls `pool.invalidate(); pool.validate(); fire = pool.best_client()` then `eth_getTransactionCount`/`eth_gasPrice`/`eth_getBalance`/`eth_chainId` all on `fire`. |
+| 6 | 429 not transport / 66s hot loop | **VERIFIED-FIXED** | L138 handles 429 explicitly; L228 matches `"RPC 429"` as transport. L802 hot loop: `primary.call("eth_call", â¦, max_retries=1)`. |
+| 7 | --function-call parse | **VERIFIED-FIXED** | `parse_function_call()` (L485â525) with keccak selector + address/bool/uintN/bytes32. argparse `nargs="+"` (L975). |
+| 8 | Password on CLI | **VERIFIED-FIXED** | `resolve_password()` (L845â855); `--password default=""` everywhere (L917, 922, 937, 967); help text mentions env fallback. |
+| 9 | --max-price 0 clash | **VERIFIED-FIXED** | L588: `if max_price_per_nft_wei > 0 and mint_wei > max_price_per_nft_wei * quantity` â zero short-circuits. |
+| 10 | Docs drift | **VERIFIED-FIXED** | SKILL.md and `security-first-mint-pipeline.md` match CLI; auto-mode and os-check warnings present in both files. |
+
+---
+
+## NEW Findings
+
+### ð´ CRITICAL â `validate_chain` failure path treats wrong-chain RPC as transport error and fails over
+**Location:** `RPCPool.call()` L256â276 vs `RPCClient.call()` L142.
+
+`validate()` raises `SafeMintError` on chain mismatch (L218). The error message starts with `"chain X, expected Y"` â does **not** match `"RPC transport error"` or `"RPC 429"` or `"-32601"`. So it correctly propagates. â â but `watch` calls `primary.call("eth_call", â¦)` first and *then* checks chain via the later `validate_chain(fire, int(chain_hex, 16))` (L806). If the primary RPC silently lies about chainId for `eth_call` (some DRPC endpoints do), `eth_call` may execute against a different chain view. Recommend: `validate_chain(pool.best_client(), chain_id)` **before** the watch loop, not after.
+
+### ð´ CRITICAL â Final `eth_call` simulation at L800 uses `max_retries=0` semanticsâ¦ wait, no, it uses default retries (6 Ã 11s = 66s) right before signing
+**Location:** L800â803.
+
+```python
+fire.call("eth_call", [call_obj, "pending"])        # default max_retries=6 on fire endpoint
+gas_hex = fire.call("eth_estimateGas", [...])      # default max_retries=6
+```
+
+The hot-loop 429 fix only protects the **watch poll** (L793). The two pre-sign calls and the `eth_getTransactionReceipt` retry loop (L825â833, also `max_retries=1` â) use defaults. Under NodeFlare 1 req/10s, the final pre-sign simulation can stall 66s right at the trigger moment â missing the mint window. Same risk for `eth_estimateGas`. Recommend: `max_retries=1` on both final sim calls.
+
+### ð  HIGH â `eth_gasPrice` against a free-mint tx has no fee cap; `enforce_limits` uses `gas_price_wei` as-is
+**Location:** L581â588.
+
+`gas_price_wei` comes from RPC with no ceiling. If the user sets `--max-fee 0.0005` but the chain tip is 50 gwei, the check `network_fee = gas_limit * gas_price_wei > max_network_fee_wei` does fire â good. But the comparison happens **after** `gas_limit = int(estimate * 1.15)` (L807). If estimate is 500k at 50 gwei â 0.025 ETH, check fails. Acceptable. **However**: there is no `max_fee_per_gas` ceiling independent of gas limit. A malicious/poisoned RPC returning `gasPrice=1000 gwei` causes the limit to fail loudly â fine. No bug here, downgrade to note.
+
+### ð  HIGH â `parse_function_call` allows negative integers via `int(a, 0)` with no bounds check
+**Location:** L517.
+
+```python
+elif t.startswith("uint"):
+    words.append(f"{int(a, 0) & ((1 << 256) - 1):064x}")
+```
+
+`int("-1", 0) & ((1<<256)-1)` = `2^256 - 1` â silently coerced. For a `uint8` field this passes a garbage value that will revert on-chain (good) â but the user gets no pre-flight warning. Lower priority: most ABIs reject this at simulate time. **Not a critical bug**, but masks config errors.
+
+### ð  HIGH â `broadcast_same_raw` "known transaction" returns keccak hash but the signed tx may have been nonce-shifted by a competing parallel broadcast
+**Location:** L386.
+
+If two wallets fire simultaneously and the second wallet's nonce collides with this wallet's pending tx on the mempool of endpoint A, endpoint B sees `already known` and returns the correct hash. But endpoint A returning a *different* hash (e.g. its own `eth_sendRawTransaction` accepting a different nonce) is not handled â the function returns whichever the loop hits first. **Pre-existing behavior, not introduced by the fix.** Note only.
+
+### ð  HIGH â `keystore addr` and `keystore create` accept password from CLI without warning
+**Location:** L905â922.
+
+`resolve_password()` is called, but no warning is printed to stderr when `--password` is used (only the help text mentions env var). Recommend: print a one-line `[!] password passed on CLI â consider SAFE_MINT_PASSWORD env var` to stderr in these subcommands.
+
+### ð¡ MEDIUM â `record_run` never writes FAILED/PENDING tx_hash updates when record_run was already called as BROADCAST
+**Location:** L816, L839.
+
+L816 inserts `BROADCAST` row. L839 inserts a *second* row with state `CONFIRMED`/`FAILED`/`PENDING`. The duplicate-guard query (L649) checks `state IN ('BROADCAST','CONFIRMED')` â so a FAILED retry on the same contract is allowed â. But the historical BROADCAST row stays in the table with no link to the final outcome. Cosmetic; acceptable.
+
+### ð¡ MEDIUM â `--mode auto` accepts `--max-price 0` (no per-NFT cap) silently
+**Location:** L587 + argparse `--mode` choices (L979).
+
+`auto` + `max-price 0` + a paid mint = no upper bound on per-NFT price â only `max_total` constrains. With `max-total` default 0.001 ETH and a 1 ETH mint, the chain simulation will revert, but the limits check passes (total â¤ 0.001? No â would fail). Actually safe. **But** the help text for `--max-price` should explicitly warn: `"0 = NO per-NFT limit (uses --max-total only)"`. Currently says `"max price per NFT in ETH"` â ambiguous.
+
+### ð¡ MEDIUM â `chain_id` argument parsed with `--chain-id` everywhere but `cmd_watch` never passes it to `enforce_limits`
+Not a bug â chain_id is only used for tx signing. Skip.
+
+### ð¡ MEDIUM â `requests.Session` is module-level per-RPCClient but `close()` is only called on pool shutdown; if `safe_mint` raises mid-loop the sessions leak
+**Location:** `RPCClient.close()` L148; `RPCPool.close()` L388.
+
+No `try/finally` around `run_watch`. On `SafeMintError` in the broadcast path, the session objects linger until GC. Minor; not security-relevant.
+
+### ð¢ LOW â `redact()` regex `0x[a-fA-F0-9]{4}[a-fA-F0-9]{40,}` matches private keys (64 hex) but NOT wallet addresses (40 hex + 0x prefix = 42 chars â matches `[a-fA-F0-9]{40,}` â). However it also matches data hex (e.g. calldata in error messages) and turns it into `0xABCD...` â fine, but logs become harder to debug.
+
+### ð¢ LOW â `probe_public_drop_price` does not check that the contract is actually SeaDrop. A non-SeaDrop contract that happens to have a `getPublicDrop(address)` selector would return garbage. L851 logs `unavailable` on error but on success-with-garbage it would still report a number. Recommend: verify the returned tuple's first 3 fields are sane (startTime < endTime, feeBps â¤ 10000).
+
+---
+
+## Final Verdict: **NEEDS-FIX**
+
+Two real pre-sign reliability bugs:
+1. **CRITICAL**: `chain_id` not validated until *after* the watch loop completes â silent cross-chain view possible on misbehaving RPC.
+2. **CRITICAL**: Final pre-sign `eth_call` + `eth_estimateGas` use default `max_retries=6` â under NodeFlare 1 req/10s, 66s stall right at trigger time, missing the mint window. The 429 fix was applied to the watch poll but not to the fire-time reads.
+
+Both are easy one-line fixes (`max_retries=1` on L800, L803; move `validate_chain` to before the watch loop). The HIGH/MEDIUM items are hardening, not blockers.
+
+**Proper after these two fixes.**

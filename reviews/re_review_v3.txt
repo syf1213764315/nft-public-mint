@@ -1,0 +1,183 @@
+HTTP 200
+I'll verify each fix and look for new issues. Going through the code carefully.
+
+## Verification of Stated Fixes
+
+**1. CRITICAL: keccak vs sha3_256** â **VERIFIED-FIXED**
+- Line 27-30: `from eth_hash.auto import keccak as _keccak_bytes` with fallback to `eth_utils.keccak`.
+- Line 34: `def keccak(data: bytes) -> bytes: return _keccak_bytes(data)`.
+- `SEADROP_PUBLIC_DROP_SELECTOR = "0x6d5d595a"` is hardcoded (correct keccak("getPublicDrop(address)")[:4]); no `hashlib.sha3_256` import anywhere. Used in `abi_encode_call` (line 333), `checksum_address` (line 320), `broadcast_same_raw` (line 282), `parse_function_call` (line 380).
+
+**2. CRITICAL: "nonce too low" treated as success** â **VERIFIED-FIXED**
+- Lines 273-279: `if "nonce too low" in msg: raise SafeMintError(...)`. Now fatal, no fake hash returned. Only "already known"/"known transaction" returns the keccak-deterministic hash (line 280-282).
+
+**3. CRITICAL: probe_public_drop_price struct decode** â **VERIFIED-FIXED**
+- ABI (lines 81-95): standard tuple `(uint80 mintPrice, uint48 startTime, uint48 endTime, uint16 maxTotalMintableByWallet, uint16 feeBps, bool restrictFeeRecipients)` = 6 Ã 32B = 192 bytes = 6 ABI words. Decode reads offsets 0..5 (lines 458-463). Sanity flags (lines 466-475) correctly bound-check each field against its declared bit width (2^80, 2^48, 2^16). The earlier "2-word packed" claim was wrong; this is correct.
+
+**4. HIGH: FAILED-state lockout** â **VERIFIED-FIXED**
+- Lines 503-507: `state IN ('BROADCAST','CONFIRMED')`. FAILED/PENDING/SKIPPED allow retry.
+
+**5. HIGH: RPCPool cache invalidation for fire-time reads** â **VERIFIED-FIXED**
+- `invalidate()` (line 167) clears `_ranked_cache`.
+- `best_client()` (lines 173-176) returns top-ranked client after fresh `validate()`.
+- In `run_watch` (lines 562-572): `pool.invalidate(); pool.validate(); fire = pool.best_client()` then nonce/gasPrice/balance/chainId/estimateGas all called on `fire` â single endpoint pinned. â
+
+**6. MEDIUM: 429 failover + max_retries passthrough** â **VERIFIED-FIXED**
+- Line 207: `is_transport = msg.startswith("RPC transport error") or msg.startswith("RPC 429")`. Now triggers failover.
+- Line 175: `def call(self, ..., max_retries: int | None = None)`.
+- Watch loop (line 539): `max_retries=1`. Receipt wait (line 605): `max_retries=1`. Final simulation (line 580): `max_retries=1`. estimateGas (line 587): `max_retries=1`. Broadcast (line 270): `max_retries=1`. â
+
+**7. MEDIUM: --function-call parsing** â **VERIFIED-FIXED**
+- `parse_function_call()` (lines 355-397): regex-matches `name(types)`, supports `address/bool/uintN/bytes32`, keccak selector, nargs="+" argparse (line 712). â
+
+**8. MEDIUM: password on CLI** â **VERIFIED-FIXED**
+- `resolve_password()` (lines 633-643): env `SAFE_MINT_PASSWORD` fallback, warning when CLI used. â
+
+**9. MEDIUM: --max-price 0 clashed with --value** â **VERIFIED-FIXED**
+- Line 538: `if max_price_per_nft_wei > 0 and mint_wei > max_price_per_nft_wei * quantity`. Zero means "no limit". â
+
+**10. DOCS drift** â **VERIFIED-FIXED** (per file 3, which matches actual CLI).
+
+---
+
+## NEW FINDINGS
+
+### NEW-HIGH-1: `broadcast_same_raw` "known transaction" path is racy across endpoints â silent double-broadcast can still cause divergent chain state
+
+In `broadcast_same_raw` (lines 263-285): the loop iterates the first 2 healthy endpoints sequentially. When endpoint 1 returns "already known", we return the keccak-derived hash from `raw_hex` and **never send to endpoint 2**. That's actually correct (avoid double-spend nonce race). However, when endpoint 1 succeeds with a real tx hash and endpoint 2 then also receives it (because broadcast_same_raw returns after endpoint 1 succeeds), endpoint 2 will see "already known" but we already returned. So no issue here.
+
+BUT: there is a real issue â if endpoint 1 returns a successful hash `H` and we record `H` in DB, but endpoint 2 was never tried, we lose redundancy. If endpoint 1's hash was a transport-level success but the tx was actually rejected by endpoint 2's mempool (different chain head), the DB records an optimistic hash. The fix above (#5) only pins fire-time reads; it doesn't pin the broadcast to a single endpoint. Consider: pin broadcast to `fire` (best_client()) too, with a fallback only if fire returns a transport error. Current behavior tries ranked[0] AND ranked[1] concurrently is NOT the case â it's sequential, but still broadcasts to both on success path. Actually re-reading: the function `return`s on first success and only falls through to next on error. So only one endpoint sees the raw bytes on the happy path. That's fine. **No new bug here.**
+
+### NEW-MEDIUM-1: `run_watch` polls with `pool.call(eth_call, ..., max_retries=1)` but eth_call failures during the wait loop will propagate as `SafeMintError` and break the loop
+
+Lines 535-545:
+```python
+while True:
+    try:
+        primary.call("eth_call", [call_obj, "pending"], max_retries=1)
+        break
+    except SafeMintError as exc:
+        if stop_after is not None and time.monotonic() - started > stop_after:
+            raise SafeMintError(...) from exc
+        time.sleep(interval)
+```
+If `eth_call` reverts (e.g., mint not yet live), this raises a contract-level `SafeMintError` from `RPCPool.call` (lines 230-232: "if not is_transport and not is_method_not_found: raise"). The except catches it, sleeps, retries. **OK** â but only because of the broad `except SafeMintError`. If `stop_after` is set and the timeout fires, the `raise ... from exc` is correct.
+
+However, if the user passes `--stop-after 3600` but the RPC pool is permanently down (transport error for 1 hour), the loop sleeps 175ms-then-retry forever (since `stop_after` is checked only on `SafeMintError`, but transport errors ARE SafeMintErrors, so it IS checked). OK â that's correct.
+
+The bigger concern: `primary.call("eth_call", ..., max_retries=1)` â on a transport error with max_retries=1, it raises after the first attempt's failure (no internal retry). Good. But the `except SafeMintError` is too broad â it catches BOTH transport failures AND contract reverts. On transport failure, we want to fail fast (not retry forever); on revert, we want to retry. **Current behavior retries both**, which is fine for short windows but means a 1-hour transport outage with `--stop-after 0` would never raise. This is a UX issue, not a security one. **LOW.**
+
+### NEW-MEDIUM-2: Chain validation is called BEFORE the watch loop using `primary.call("eth_chainId")` and `validate_chain(primary, ...)` â but the loop then calls `primary.call("eth_call", ...)` which can fail over to a DIFFERENT endpoint than the one whose chainId was just validated
+
+Lines 530-532 validate chain on `primary` (which is `pool`). Then the loop calls `primary.call("eth_call", ...)`. Internally, `pool.call` fails over to any ranked endpoint that supports `eth_call` (ranked[0], ranked[1], ...). All ranked endpoints were chain-validated in `pool.validate()` (line 167 sets `validated_chain=True`), so this is safe â but only because `validate()` was called before the loop. **OK**, but fragile: if `invalidate()` is ever called between `validate()` and the loop, chain validation could be re-done against a different endpoint. The current code doesn't call `invalidate()` until line 563 (after the loop), so this is fine. **Not a real bug, just fragile design.**
+
+### NEW-MEDIUM-3: `probe_public_drop_price` reads from `client` which is `pool`, but `pool.call(...)` will fail over to ANY ranked endpoint â including one that doesn't support `eth_call` (it gets skipped via `h.supports(method)` filter, so OK). But the function signature takes `RPCClient`, then internally calls `client.call(...)` not `pool.call(...)` â this means it bypasses the pool entirely
+
+Lines 458-461: `result = client.call("eth_call", [{"to": contract, "data": calldata}, "latest"])`. The caller passes `pool` as `client` (line 526: `drop = probe_public_drop_price(primary, checksum_contract)` and `primary = pool`). Since `pool` is not an `RPCClient` but an `RPCPool`, this would crash. **WAIT** â let me check.
+
+Looking at line 81: `def probe_public_drop_price(client: RPCClient, contract: str)`. Caller passes `primary` which is `pool` (line 519: `primary = pool`). `RPCPool` has no `call` method... actually it does (line 175). But the type annotation says `RPCClient`. The duck-typed call works because `RPCPool.call(method, params, allow_fallback=True)` is compatible (extra `allow_fallback` default). However, `RPCPool.call` does NOT have `max_retries` keyword in the same position... let me check.
+
+`RPCPool.call(self, method, params=None, allow_fallback=True, max_retries=None)` â yes, `max_retries` is the 4th positional. `RPCClient.call(self, method, params=None, max_retries=None)` â `max_retries` is the 3rd positional.
+
+In `probe_public_drop_price`: `client.call("eth_call", [{"to": contract, "data": calldata}, "latest"])` â only method + params. So it hits `RPCPool.call(method, params, allow_fallback=True, max_retries=None)`. **This works by accident** â both signatures accept these args.
+
+But there's a real issue: when `client` is `pool`, the eth_call goes through `pool.call` which fails over across all healthy endpoints. That's actually correct behavior (NodeFlare is rate-limited so failover is needed). **OK, works by design.**
+
+But wait â what if someone passes a single `RPCClient` (e.g., from `cmd_check` line 651: `client = pool.clients[ranked[0].url]`)? That's also fine. **Not a bug.**
+
+### NEW-HIGH-2: `cmd_check` probe order: contract-code check happens BEFORE chain validation completes via `pool.call`
+
+Lines 644-651:
+```python
+pool = RPCPool(urls, args.chain_id)
+ranked = pool.validate()
+if not ranked:
+    raise SafeMintError(...)
+client = pool.clients[ranked[0].url]
+validate_chain(client, args.chain_id)   # validates chain on client (which IS ranked[0])
+contract = checksum_address(args.contract)
+code = get_code(pool, contract)         # uses pool (failover-capable)
+```
+
+`validate_chain` (line 142) calls `client.call("eth_chainId")` directly on `client` (which is `ranked[0]`). Then `get_code(pool, contract)` calls `pool.call("eth_getCode", ...)` which can fail over to `ranked[1]`. All ranked endpoints were chain-validated by `pool.validate()`. **Safe.**
+
+But `validate_chain` only validates the FIRST ranked endpoint, not the pool. The `pool.validate()` does validate all (line 167: `for url in self.urls: self.probe(url, validate=True)`), so this is redundant-but-safe. **OK.**
+
+### NEW-MEDIUM-4: `os-check --wallet` does not verify the OpenSea-returned `to` address matches a contract on the expected chain
+
+Lines 686-689: prints `mint.to`, `value`, `calldata`. Never calls `eth_getCode` on `mint.to`. So a malicious or stale OpenSea response could point to any address. The `watch` command will validate code at runtime, but `os-check` is supposed to be the pre-flight gate. **MEDIUM: defense-in-depth gap**, but the README explicitly states os-check is "chain + value==0 + domain" only â by design.
+
+### NEW-MEDIUM-5: `parse_function_call` silently allows `uint` overflow because `int(a, 0)` returns ArbitraryInt and the comparison `val >= (1 << 256)` happens AFTER `int(...)` succeeds
+
+Lines 391-394:
+```python
+val = int(a, 0)
+if val < 0 or val >= (1 << 256):
+    raise SafeMintError(f"uint arg {a!r} out of range for {t!r}")
+words.append(f"{val:064x}")
+```
+The check IS done before the encode. **OK, not a bug.**
+
+But for `uint8`/`uint16`/etc., there's NO width check â `uint8` accepts values up to 2^256. The signature parser doesn't enforce declared width vs value. **LOW: ABI encoding will mask via `& ((1<<256)-1)` so it won't crash, but `mintPublic(uint8, 5)` with arg `999999999999` will silently encode as `999999999999` and likely revert at the contract. Not a security bug, just a UX nit.**
+
+### NEW-MEDIUM-6: `--value` accepts arbitrary-precision Decimal string but `eth_to_wei` quantizes with `ROUND_DOWN` â passing `0.0000000000000000001` (less than 1 wei) silently becomes 0 wei â user thinks they sent value but tx was value=0
+
+Lines 524-526:
+```python
+dv = value if isinstance(value, Decimal) else Decimal(str(value))
+return int((dv * WEI_PER_ETH).to_integral_value(rounding=ROUND_DOWN))
+```
+For `0.0000000000000000001 ETH`, `Decimal * 10^18 = 1e-1`, `ROUND_DOWN` â 0. **User intended non-zero value, got 0**. The `enforce_limits` check then sees `mint_wei=0` and may skip price-cap enforcement (depends on `--max-price`). For free-mint verification this is consistent (`getPublicDrop().price == 0`); for paid mints it's a footgun. **MEDIUM: silently loses value below 1 wei.** The fix is to either reject sub-wei values or warn.
+
+### NEW-HIGH-3: `broadcast_same_raw` returns the keccak(raw_tx) hash for "already known" â but if the FIRST endpoint rejected with a contract-level error (revert) and the SECOND endpoint returns "already known", the returned hash is for a tx that already failed
+
+Lines 263-285: on the happy path, if `health[0]` raised a non-transport/non-method-not-found error, `RPCPool.broadcast_same_raw` doesn't have a try/except that distinguishes contract reverts from transport. Let me re-read.
+
+```python
+for health in list(ranked):
+    try:
+        h = self.clients[health.url].call("eth_sendRawTransaction", [raw_hex], max_retries=1)
+        return str(h)
+    except SafeMintError as exc:
+        msg = str(exc).lower()
+        errors.append(str(exc))
+        if "nonce too low" in msg:
+            raise ...
+        if "already known" in msg or "known transaction" in msg:
+            return "0x" + keccak(...)
+```
+If endpoint 1 raises a `SafeMintError` with `"already known"` in the message, we return the keccak hash. The earlier fix (#2) only addressed "nonce too low", not "already known". The concern: if endpoint 1 returns "already known" because a DIFFERENT tx (different nonce) was previously broadcast by this wallet, the hash we compute corresponds to our signed raw tx, NOT the tx that was actually accepted into the mempool. **The returned hash could be misleading.**
+
+However, "already known" means the exact same tx (by hash) is already in the mempool. Since tx hash is deterministic from signed bytes, if the mempool has "this tx", the hash we compute is correct. **Actually safe** â tx hash IS keccak(RLP(nonce,gasPrice,gas,to,value,data,v,r,s)). â
+
+But the path is: what if endpoint 1 returns "already known" because endpoint 2 already accepted it (in a previous session)? Then the hash is still correct. â
+
+**OK, no new bug here.**
+
+### NEW-MEDIUM-7: `os-check --wallet` runs `client.build_mint()` which is a POST â this side effect is called without any confirmation
+
+Line 677: `mint = client.build_mint(slug, args.wallet, args.quantity)`. The README warns the user, but the CLI doesn't ask "are you sure". A user running `os-check --wallet 0x...` to "just check" will trigger a server-side slot reservation. **The doc warns; this is documented behavior. Not a bug, but a UX hazard.**
+
+### NEW-LOW-1: `redact()` regex `(0x[a-fA-F0-9]{4})[a-fA-F0-9]{40,}` matches ANY 44+ hex char string starting with 0x, which would redact EIP-55 addresses printed in logs (good!) but ALSO would redact any tx hash / selector printed in logs. This makes post-mortem debugging harder.
+
+Line 109: `re.sub(r"(0x[a-fA-F0-9]{4})[a-fA-F0-9]{40,}", r"\1...", text)`. A 66-char hex string (32 bytes + 0x) starts with `0x` and has 64 chars after â `64 >= 40`, so it WILL be redacted to `0xabcd...1234` style. Tx hashes and selectors are unusable for debugging after a failure. **LOW: ops friction.** Should match only 40-char (address) or 66-char (tx hash) specifically, or whitelist selectors (`0x` + 8 hex).
+
+### NEW-MEDIUM-8: Receipt wait uses `fire` endpoint for `eth_getTransactionReceipt` but `fire` is the same endpoint that did the broadcast â if `fire` returns a different `tx_hash` (impossible, but consider) or if the receipt is on a reorg, we never check the backup. Also, `receipt` could be `None` (tx still pending) and we wait 120s on a single endpoint. If `fire` is rate-limited, the receipt wait could block.
+
+Lines 600-611: pure single-endpoint polling. No failover during receipt wait. If NodeFlare rate-limits here, we get a `SafeMintError` (caught by `except SafeMintError: pass`), sleep 0.5s, retry. With max_retries=1, one transport failure eats 0.5s; multiple failures eventually loop 120s. **OK, not a bug, but transport errors during receipt wait cause silent retry-without-progress.**
+
+### NEW-LOW-2: `RPCPool.probe` measures latency only on success path; on failure `latency_ms` stays at `inf` (initial) or previous value. After a transient outage, the endpoint keeps its old low latency but high failure count. The `score` formula:
+```python
+return self.latency_ms + lag_penalty + failure_penalty
+```
+uses `(1 - reliability) * 2_000` â but `reliability = successes / total`. So an endpoint with 100 successes and 1 failure has `reliability = 100/101 = 0.99`, `failure_penalty = 10`. That's small enough that a slow-but-reliable endpoint beats a fast-but-flaky one. **Actually correct ranking. Not a bug.**
+
+### NEW-MEDIUM-9: `run_watch` does NOT update the `last_error` on the best endpoint when its chain validation succeeds but later `eth_getBalance` fails â the cached health stays "healthy" because `successes` only increments in `probe()`, not in `call()`. So a single fire-time read failure doesn't demote the endpoint, but subsequent probes will catch it.
+
+Lines 562-572: `pool.invalidate(); pool.validate()` re-probes everything, so this is mitigated. **OK.**
+
+### NEW-LOW-3: `decode_uint256` is used to parse `eth_getTransactionReceipt` `status` field at line 612: `int(receipt.get("status", "0x0"), 16) == 1`. The default `"0x0"` means "failed", which silently masks missing-status responses. If `receipt` is missing `status` (non-standard chain?), we mark FAILED. Robinhood Chain is EVM-compatible so this should always be present. **LOW: defensive default.** Not a real bug.
+
+### NEW-MEDIUM-10: `RPCPool.call` `is_transport` detection checks message prefixes â fragile if RPC error format varies
+
+Line 207: `is_transport = msg.startswith("RPC transport error") or msg.startswith("RPC 429")`. But `is_transport` then ALSO needs to match the HTTP 400 from DRPC. Currently DRPC returns HTTP 400 (per README), which `RPCClient.call` raises as `SafeMintError(f"RPC HTTP 400 on ...")` â that DOES start with `"RPC HTTP "`, not `"RPC transport error"`. So the `is_method_not_found` branch is the one that fires (if `"-32601"` is in the message). For DRPC, the message is `"RPC HTTP 400 on https://robinhood.drpc.org: {"jsonrpc":"2.0","id":1,"error":{"code":-32601,...}}"`. The error body contains `-32601`, so

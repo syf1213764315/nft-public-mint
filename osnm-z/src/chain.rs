@@ -16,7 +16,7 @@ use crate::{
 
 const RPC_RESPONSE_LIMIT: usize = 1024 * 1024;
 const RPC_CONTENT_LENGTH_LIMIT: u64 = 1024 * 1024;
-const WALLET_SNAPSHOT_MAX_ATTEMPTS: usize = 2;
+const WALLET_SNAPSHOT_MAX_ATTEMPTS: usize = 5;
 const EIP7702_PROBE_CALLDATA: &str = "0xc1cd7856";
 const EIP7702_PROBE_DELEGATE: &str = "0x1234567890abcdef1234567890abcdef12345678";
 const EIP7702_PROBE_ACCOUNT: &str = "0x000000000000000000000000000000000dead123";
@@ -752,10 +752,7 @@ fn decode_submission_batch(envelope: &Value, index: usize) -> Result<SubmissionI
     let base_fee_per_gas = block
         .base_fee_per_gas
         .as_deref()
-        .ok_or(ChainError::Eip1559Unavailable)
-        .and_then(|value| {
-            parse_quantity_u256(value).map_err(|_| ChainError::InvalidResponse { index })
-        })?;
+        .and_then(|value| parse_quantity_u256(value).ok());
     let pending_nonce: String = serde_json::from_value(
         results[1]
             .take()
@@ -770,17 +767,37 @@ fn decode_submission_batch(envelope: &Value, index: usize) -> Result<SubmissionI
             .ok_or(ChainError::BatchUnsupported { index })?,
     )
     .map_err(|_| ChainError::InvalidResponse { index })?;
-    let max_priority_fee_per_gas =
-        parse_quantity_u256(&priority_fee).map_err(|_| ChainError::InvalidResponse { index })?;
-    let max_fee_per_gas = base_fee_per_gas
-        .checked_mul(U256::from(2_u8))
-        .and_then(|value| value.checked_add(max_priority_fee_per_gas))
-        .ok_or(ChainError::QuantityOverflow)?;
+    // H2: chains with inconsistent EIP-1559 (e.g. BSC public RPCs omit
+    // baseFeePerGas) no longer hard-fail the whole batch. Derive fees from
+    // whatever is available; when base fee is missing we fall back to
+    // eth_maxPriorityFeePerGas (the eth_gasPrice-like value) so the EIP-1559
+    // envelope still has sane fields. A missing base fee is recorded as None
+    // in LatestBlock so callers can decide whether to retry via legacy.
+    let (max_fee_per_gas, max_priority_fee_per_gas) = match base_fee_per_gas {
+        Some(base_fee) => {
+            let max_priority_fee_per_gas =
+                parse_quantity_u256(&priority_fee).map_err(|_| ChainError::InvalidResponse { index })?;
+            let max_fee_per_gas = base_fee
+                .checked_mul(U256::from(2_u8))
+                .and_then(|value| value.checked_add(max_priority_fee_per_gas))
+                .ok_or(ChainError::QuantityOverflow)?;
+            (max_fee_per_gas, max_priority_fee_per_gas)
+        }
+        None => {
+            // No base fee — approximate max_fee from the priority fee estimate.
+            let priority = parse_quantity_u256(&priority_fee)
+                .map_err(|_| ChainError::InvalidResponse { index })?;
+            let max_fee_per_gas = priority
+                .checked_mul(U256::from(2_u8))
+                .ok_or(ChainError::QuantityOverflow)?;
+            (max_fee_per_gas, priority)
+        }
+    };
 
     Ok(SubmissionInputs {
         latest_block: LatestBlock {
             timestamp,
-            base_fee_per_gas: Some(base_fee_per_gas),
+            base_fee_per_gas,
         },
         pending_nonce,
         fee_estimate: FeeEstimate {

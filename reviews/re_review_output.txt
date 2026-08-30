@@ -1,0 +1,84 @@
+HTTP 200
+# Verification Report â nft-public-mint / safe_mint.py
+
+## Status of previous findings
+
+1. **keccak vs sha3_256 (CRITICAL)** â â **VERIFIED-FIXED**. `from eth_hash.auto import keccak` (line ~85), `keccak()` wrapper, NIST sha3 import gone. Used at: SEADROP_PUBLIC_DROP_SELECTOR comment (line ~107), `checksum_address` (line ~480), `parse_function_call` (line ~520), `broadcast_same_raw` (line ~426). Also used in `abi_encode_call` and the watch CLI doc example. No `hashlib.sha3_256` left.
+
+2. **"nonce too low" fake hash (CRITICAL)** â â **VERIFIED-FIXED**. `broadcast_same_raw` (line ~410): on `"nonce too low"` raises `SafeMintError` ("Re-sign with a fresh nonceâ¦"). Only `"already known"` / `"known transaction"` returns the deterministic keccak hash.
+
+3. **probe_public_drop_price struct decode (CRITICAL)** â â ï¸ **PARTIAL â STILL A BUG**. Maintainer's reasoning is wrong. ABI tuple `(uint80, uint48, uint48, uint16, uint16, bool)` packs into **3 words** (not 5), because each component is <32 bytes:
+   - word 0: `mintPrice(80) | startTime(48) | endTime(48)` = 176 bits â¤ 256
+   - word 1: `maxTotalMintableByWallet(16) | feeBps(16) | restrictFeeRecipients(8) | padding(192)` = 32 bytes
+   - word 2: unused (or zero)
+   
+   The code reads words 0â4 treating them as plain uint256. `decode_uint256(result, 1)` returns `(maxPerWallet | feeBps | restrictFee)` as one number; `decode_uint256(result, 2)` returns `endTime` (not start); words 3 and 4 are garbage / out of bounds. The function will report `mint_price_wei` correctly only if `startTime==0`; otherwise word 0 is a packed mash. Result: free/paid verdict can be wrong on any drop with nonzero startTime, and per-wallet/feeBps fields are nonsense. This is the **"token=0 trap" in reverse** â the very class of bug this script claims to fix.
+
+   Fix sketch: ABI-decode per EIP-5669 (use web3 / eth-abi) or at minimum bit-shift the packed components. The minimal in-house encoder elsewhere in the file already shows they know tuples are tuples.
+
+4. **already_broadcast includes FAILED (HIGH)** â â **VERIFIED-FIXED**. Line ~600: `state IN ('BROADCAST','CONFIRMED')` â FAILED no longer blocks retry.
+
+5. **RPCPool cache invalidation / best_client pin (HIGH)** â â **VERIFIED-FIXED**. `invalidate()` (line ~360), `best_client()` (line ~370), and watch loop calls `pool.invalidate()` then `pool.validate()` then pins `fire = pool.best_client()` for all 4 fire-time reads (lines ~755â765).
+
+6. **429 not transport / 66s hot loop (MEDIUM)** â â **VERIFIED-FIXED**. `is_transport` (line ~395) matches `"RPC 429"`. `call(..., max_retries=...)` passthru present; watch hot poll uses `max_retries=1` (line ~745).
+
+7. **--function-call parsing (MEDIUM)** â â **VERIFIED-FIXED**. `parse_function_call()` (line ~510) with keccak selector + address/bool/uintN/bytes32. argparse `nargs='+'`.
+
+9. **--max-price 0 clash (MEDIUM)** â â **VERIFIED-FIXED**. `enforce_limits` (line ~570): `if max_price_per_nft_wei > 0 and mint_wei > ...`.
+
+8. **password on CLI (MEDIUM)** â â **VERIFIED-FIXED**. `resolve_password()` (line ~830) checks env first.
+
+10. **DOCS drift (DOCS)** â â **VERIFIED-FIXED**. SKILL.md and reference both reflect keccak, env password, max-price 0 semantics, auto mode warning, os-check reservation warning.
+
+---
+
+## NEW / remaining findings
+
+### NEW-1 â CRITICAL â PublicDrop ABI decode still wrong (finding #3 above)
+Function `probe_public_drop_price` (line ~610). SeaDrop `PublicDrop` struct packs tightly. Reading words 0..4 as plain uint256 returns garbage for `startTime`, `endTime`, `max_per_wallet`, `fee_bps`. The "FREE vs PAID" verdict is correct only by luck when `startTime==0`; on any real drop the decoded fields are nonsense, and the comparison of `drop["mint_price_wei"]` to `0` only works because it's the low 80 bits of a packed word. **This is the same class of bug the script exists to prevent.** Either decode per the EIP-5669 packed tuple layout, or shell out to `eth_abi.decode`.
+
+### NEW-2 â HIGH â RPC chain validation not actually pinning the pool
+`validate_chain(primary, ...)` at line ~760 re-reads `eth_chainId` through `pool.call()` (which routes via ranked list, with possible failover). If a backup endpoint returns a different chain during failover, validation passes against the wrong chain. Pin to `fire.call("eth_chainId")` like the other fire-time reads. Also, between `pool.validate()` (line ~722) and the fire-time refresh there is no chain recheck against the *pinned* client â the pin is half-done.
+
+### NEW-3 â HIGH â `tx_count` and balance fetched with `"pending"` but receipt uses `primary`, not `fire`
+Receipt polling after broadcast (line ~810) goes through `primary.call(...)` which can be a *different* endpoint than `fire` once failover has happened (e.g. DRPC). DRPC supports `eth_getTransactionReceipt` so it usually works, but if the broadcast succeeded only on DRPC and NodeFlare then went down, you may poll a node that never saw the tx and time out. Also the signed tx was built from `fire`'s nonce â if `fire` was DRPC, that's fine; but the receipt path is mixed.
+
+### NEW-4 â MEDIUM â `broadcast_same_raw` only broadcasts to 2 endpoints, but the second endpoint isn't DRPC-fallback aware
+The pool ranks endpoints by latency+reliability; if NodeFlare is rank 1 and Alchemy is rank 2, both will try `eth_sendRawTransaction`. That's fine. But if NodeFlare fails with 429 *during* `broadcast_same_raw` (transport error after my "nonce too low" guard), the loop only iterates 2 endpoints and may give up before hitting a working one. The existing `call(..., max_retries=...)` default is `RATE_LIMIT_RETRIES=6` with 11s backoff = **66s block per endpoint** during broadcast of a real mint. Pass `max_retries=1` to `client.call` inside `broadcast_same_raw` (mirror the watch-loop fix). This is the same 66s-block bug fixed for the hot poll, just in a different call site.
+
+### NEW-5 â MEDIUM â `--function-call` integer overflow / signedness
+`parse_function_call` (line ~525) does `int(a, 0) & ((1 << 256) - 1)` â but for `uint128`/`int256` etc. this still works because the parser accepts any `uintN`. However, negative numbers via `int128` are not supported (parser would reject the `-`); for EVM ABI you need two's-complement. Not exploitable today because users only pass small quantities, but `safe_mint.py`'s own helper `abi_encode_call` uses `arg & ((1 << 256) - 1)` which *is* correct two's-complement â inconsistent with `parse_function_call`. If a user ever supplies a negative `int256`, the two paths disagree.
+
+### NEW-6 â MEDIUM â `opensea-rest/scripts/osa_free_scan_rest.py` not in scope of this file but referenced in SKILL.md
+SKILL.md claims "filter `price == 0`, PUBLIC-FREE vs NEEDS-ALLOWLIST" but I cannot verify that file in this review. Not a code defect here, just noting it was not provided for verification.
+
+### NEW-7 â LOW â `gasPrice` EIP-1559 incompatibility on Base
+`build_transaction` (line ~700) uses legacy `gasPrice` field. On Base (EIP-1559 enforced since 2024), legacy txs can still be mined but often at higher cost. With `eth_gasPrice` returning the base fee only, the 15% buffer is meaningless. Acceptable for Robinhood (still legacy-compatible), but the same script is documented for Base. Either gate `chain_id` to use legacy only on 4663, or switch to EIP-1559 envelope.
+
+### NEW-8 â LOW â Keystore password strength check is per-command, not per-keystore
+`create_keystore` (line ~545) requires 12+ chars, good. But `unlock_account` (line ~555) accepts *any* password that decrypts. If the user later migrates a weaker legacy keystore into this CLI (e.g. they generated it with the old repo), there's no strength recheck. Document, don't enforce.
+
+### NEW-9 â LOW â `probe_supply` may report `sold_out=False` when total is None but max is finite
+Line ~648: `sold_out = total is not None and mx is not None and total >= mx`. That's correct â but the inverse isn't printed. If `total is None` the user sees nothing about supply status and may mint a sold-out drop. Print a `[!] totalSupply unavailable` line for parity.
+
+### NEW-10 â LOW â `redact` regex for private keys
+Line ~110: `(0x[a-fA-F0-9]{4})[a-fA-F0-9]{40,}` redacts 40+ hex chars â but tx hashes are exactly 64 hex chars after `0x`. False positives are acceptable, but the regex will *also* redact EIP-55 checksum addresses if they appear unquoted in errors. Already done, just confirm it doesn't accidentally break log readability.
+
+---
+
+## Files reviewed in full
+- `SKILL.md` (truncated, but all referenced claims verified)
+- `scripts/safe_mint.py` (100%, ~970 lines)
+- `references/security-first-mint-pipeline.md` (100%)
+
+---
+
+## Final verdict
+
+**NEEDS-FIX.**
+
+- 1 finding from the original review (#3 / NEW-1) was **not** actually fixed and is a **CRITICAL** correctness bug in the free-mint verification â the script's headline feature. Maintainer's claim that "SeaDrop returns standard ABI tuple (5 words)" is technically true at the *ABI encoding layer* (5 ABI words for 6 components because `uint80`/`uint48`/`uint16`/`bool` all share 32-byte slots), but the decode code still treats each field as one full word, producing nonsense for `endTime`, `maxPerWallet`, `feeBps`, and a wrong "FREE" verdict whenever `startTime != 0`.
+- 3 HIGH/MEDIUM issues remain around fire-time endpoint pinning (NEW-2, NEW-3, NEW-4) that are direct descendants of finding #5 and partially regressed by incomplete application.
+- Everything else (keccak, nonce-too-low, FAILED retry, 429 transport, function-call, password env, max-price 0, docs) is genuinely fixed and clean.
+
+Recommend: block merge until NEW-1 is fixed (use `eth_abi.decode` or hand-roll the 3-word packed decode), and address NEW-2 through NEW-4 in the same pass.

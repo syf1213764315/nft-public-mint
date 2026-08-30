@@ -1,0 +1,260 @@
+HTTP 200
+# Cross-Chain Security Review â `nft-public-mint` Skill
+
+I've reviewed the package against the 8 declared EVM chains plus Solana metadata. Below are real findings with file:line evidence.
+
+---
+
+## CRITICAL Findings
+
+### C1. SeaDrop singleton address is **assumed** to be identical on every chain â not verified at runtime
+
+**Where:** `src/seadrop-public.ts:14` (`SEADROP_ADDRESS = "0x00005EA00Ac477B1030CE78506496e8C2dE24bf5"`) and `references/multichain-rpc-reference.md:11`.
+
+**What:** The doc states "SAME across all EVM chains." The TS sniper hardcodes the address with no on-chain sanity check (no `eth_getCode` on the singleton before encoding calldata). The Rust `ChainGateway` does probe `eth_chainId` correctly, but the SeaDrop address itself is trusted blindly.
+
+**Why it matters:** A different chain could have a different contract at that vanity address (CREATE2 vanity mining is cheap, and a malicious chain deployer can mirror the address). On a chain where the singleton is malicious or non-existent, `mintPublic(...)` calldata could:
+- Drain `value` (because the user signs `value: mintPrice Ã quantity` against an arbitrary contract).
+- Trigger an approve-and-exploit path if the attacker contract is `IERC20.setFrom()`-shaped.
+
+**Exploit scenario:** User pastes "BSC" RPC, sniper builds `0x00005EA00â¦` calldata, but that address on BSC is some scammer's contract. The signed tx transfers BNB to the attacker and calls whatever fallback it wants.
+
+**Fix:** Before encoding `mintPublic`, call `provider.getCode(SEADROP_ADDRESS)` and verify it's non-empty AND that the bytecode matches a known SeaDrop implementation (compare against a canonical hash from Ethereum mainnet). Fail loudly otherwise. Also gate this in the wizard: refuse to mint on any chain not in a hardcoded allowlist OR require the user to supply the per-chain SeaDrop address.
+
+---
+
+### C2. Sponsored EIP-7702 dispatcher on chains that **do not support EIP-7702**
+
+**Where:** `osnm-z/src/sponsored.rs` (entire file); `references/robinhood-chain-pitfalls.md:34` admits `--fund` "BELUM support EIP-7702 â --fund akan gagal."
+
+**What:** `eip7702_is_live()` exists in `chain.rs:138` but the sponsored flow can still be wired up by config. The `SPONSORED_EXECUTOR_ADDRESS` is user-supplied via `.env` (per pitfall doc section 3), with zero validation against:
+1. The chain actually supporting EIP-7702 (live probe required at startup).
+2. The executor contract being audited/canonical.
+
+**Why it matters:** 
+- The `executeBatch(...)` calldata is signed with `chain_id: u64` baked into the EIP-712 digest (`operation_digest` line 240), so cross-chain replay to the wrong chainId fails (see H1 below for the inverse problem). Good.
+- BUT: if a user pastes a custom executor address on a non-EIP-7702 chain, the signed `authorization_list` simply gets ignored by an older chain â the user pays gas for nothing and the mint never happens.
+- Worse: the `AUDITED_EXECUTOR_RUNTIME_HASH` constant is checked against the executor's runtime code. If a user supplies a non-audited dispatcher, the OSNM-Z code does not enforce this â it just trusts the caller. This is by design, but it means a single typo in `.env` (`SPONSORED_EXECUTOR_ADDRESS=0xdeadbeefâ¦`) signs a valid EIP-7702 batch into a malicious executor that mints from all 25 wallets to attacker.
+
+**Fix:** Refuse to build sponsored transactions unless:
+1. `eip7702_is_live()` returns `Ok(true)` for the configured chain.
+2. `SPONSORED_EXECUTOR_ADDRESS` is in a hardcoded allowlist OR matches `AUDITED_EXECUTOR_RUNTIME_HASH` byte-for-byte (current code only documents the hash â does not enforce).
+
+---
+
+### C3. `safe_mint.py` `--function-call` parsing is unbounded; Solana path (`getPublicDrop`) never built but chain-id table says Solana
+
+**Where:** `references/multichain-rpc-reference.md:20` lists `solana` as a chain; `scripts/safe_mint.py --function-call` doc implies a generic ABI encoder; `references/security-first-mint-pipeline.md` only covers EVM.
+
+**What:** If anyone wires `safe_mint.py` to a Solana RPC URL (or worse, an EVM RPC whose chainId parses as `0` / overflow), the script:
+- Will not have a Solana encoder at all (ABI-encoded calldata won't make sense).
+- `check --rpc <solana>` will silently probe a chainId, get back a number, and report "OK" if it happens to match a known chain (e.g., the JSON-RPC wrapper returns `0x1` for some BS reason).
+- Cross-chain replay: a Solana adapter that happens to expose EVM-shaped JSON-RPC could accept an EIP-1559 tx and lose funds.
+
+**Fix:** Hard-reject non-EVM chainIds in `check` / `watch`. Add a `solana: false` guard at the top of the wizard. Document Solana explicitly as "REST queries only via opensea-rest/."
+
+---
+
+## HIGH Findings
+
+### H1. Replay protection: **chain_id is the only thing stopping same-raw on different chains** â and one branch drops it
+
+**Where:** `osnm-z/src/transaction.rs:107` (`sign_eip1559_transaction`) and `sign_eip7702_transaction:71` correctly embed `chain_id` in the signing payload.
+
+**Good news:** EIP-1559 (type 2) and EIP-7702 (type 4) both include `chain_id` in the RLP-signed payload, so a tx signed for chain 8453 cannot be replayed on chain 1.
+
+**However**, `src/seadrop-public.ts:96` (`encodeMintPublic`) builds **chain-agnostic calldata**. The chain safety lives entirely in:
+- `transaction.chainId` (ethers sets this when signing), and
+- The wizard's chain selection.
+
+If a user selects "Ethereum" in the wizard but pastes a Base RPC URL (or vice-versa), the ethers wallet's `chainId` is set from the **provider**, not from the user's selection. So the tx would be signed with Base's chainId and broadcast to whichever RPC was given â not actually cross-chain.
+
+The real risk is: **`populateTransaction` will use provider's chainId**, but the **wizard selected a different chain**. Result: tx may succeed on a chain the user didn't intend, against a different drop, with different fee. Not a replay â a UX bug that loses funds.
+
+**Fix:** After connecting to the RPC, the wizard must call `provider.getNetwork()` and compare `chainId` against the chain the user picked in step 2. Refuse to continue on mismatch.
+
+---
+
+### H2. `chain.rs:127` (`latest_block`) requires `baseFeePerGas` â **BSC does not have EIP-1559 by default for legacy tx, but does support it as of BSC v1.1.0+; Robinhood claims to; some RPCs strip the field**
+
+**Where:** `osnm-z/src/chain.rs:275` (`decode_submission_batch`): `block.base_fee_per_gas.as_deref().ok_or(ChainError::Eip1559Unavailable)` is a hard error.
+
+**What:** 
+- **BSC (chain 56):** EIP-1559 is supported at the protocol level since the Lorentz hard fork, but some RPCs (especially public ones) return blocks **without** `baseFeePerGas` populated. This will fail the entire batch.
+- **Avalanche C-Chain (43114):** Has dynamic fees, but with different semantics â `baseFeePerGas` can be 0 on empty blocks. `max_fee_per_gas = base_fee Ã 2 + priority` (line 286) becomes `priority_fee_per_gas` only â underpricing risk.
+- **Polygon (137):** Boron's baseFee fluctuates but `eth_maxPriorityFeePerGas` is supported. Polygon Mumbai/mainnet consistently supports it.
+
+**Exploit scenario:** BSC public RPC returns block without baseFee. The batch errors with `Eip1559Unavailable`, but the user has already typed `--max-fee 0.005` expecting a fast mint. They retry with the `osnm-z` legacy-tx fallback (if any), which signs a type-0 tx with underpriced gas, gets stuck in mempool for hours, then drops. User loses nothing (stuck tx), but misses the mint window.
+
+**Fix:** 
+1. For chains with known inconsistent `baseFeePerGas` (BSC public RPCs, some Avalanche endpoints), fall back to `eth_gasPrice` and build a legacy tx (`max_fee_per_gas = max(gasPrice, priority)` with a type-0 envelope).
+2. Detect at probe time: if `eth_getBlockByNumber("latest", false)` returns `null` for `baseFeePerGas`, mark the chain as legacy-only.
+
+---
+
+### H3. Multi-wallet nonce management under "blast": no atomic nonce reservation
+
+**Where:** `src/rpc-blast.ts:58` (`blastToAll`): broadcasts the **same** signed tx to every RPC. Works for single-wallet.
+
+**Where (multi-wallet):** `osnm-z/src/chain.rs:225` (`wallet_snapshot`) uses `eth_getTransactionCount(wallet, "pending")` to capture the nonce, with a retry on `WalletSnapshotChanged`. This is correct for a single wallet, but **does not coordinate across wallets in a batch**.
+
+**What:** When 10 wallets mint in parallel (`MAX_SELF_FUNDED_WALLETS = 10`), each wallet's nonce is captured independently. If wallet A's `eth_sendRawTransaction` is slow and wallet B's nonce is captured before A's pending tx is reflected in B's view, **B's signed nonce could collide with A's already-broadcast nonce on the same RPC**. Result: one tx rejected (`nonce too low`), the other succeeds. Not a funds loss, but a missed mint slot.
+
+**Exploit / failure scenario:** During a 1000-NT mint at 12:00:00.000 sharp, wallet A is captured at nonce=5, wallet B is captured at nonce=5 simultaneously (B's wallet happens to have nonce=5 too â both new wallets). Both txs are signed with nonce=5. Only one tx lands. 50% of mints wasted.
+
+**Fix:** 
+- Capture all wallet nonces in a single `eth_getTransactionCount` batch (multi-wallet batch is already supported per `chain.rs:174` `account_state`), OR
+- Serialize multi-wallet nonce capture: take wallet 1, sign, broadcast, wait for `eth_getTransactionReceipt("pending")` or use `eth_subscribe("pending")` to confirm inclusion before taking wallet 2's nonce.
+- Alternative: pre-sign all wallets with `nonce = nonce + slot_index` (consume nonce slots sequentially), but this requires holding the starting nonce from a single atomic read.
+
+---
+
+### H4. `references/security-first-mint-pipeline.md` `auto` mode = fire-and-forget with no final confirmation
+
+**Where:** `references/security-first-mint-pipeline.md` "Peringatan" section: *"`auto` mode TIDAK ada konfirmasi â langsung broadcast setelah simulation + limits pass."*
+
+**What:** Combined with the free-mint fix being non-blocking ("`probe_public_drop_price()` informative, non-blocking" per the same doc), `auto` mode lets a user accidentally burn gas on a **paid** mint if the on-chain probe returns 0 from a stale view OR if the price changed between probe and fire.
+
+**Exploit:** Drop launches as paid (0.005 ETH), UI labels it "free" via stale OpenSea cache, user runs `auto`, simulation passes, tx broadcasts at 0.005 ETH. User paid for the mint. Not catastrophic (NFT lands), but violates the "free only" rule the entire skill is built around.
+
+**Fix:** 
+- Make `probe_public_drop_price()` **blocking** in `auto` mode: hard-fail if `mintPrice != 0`.
+- In wizard: explicitly ask "Mint ini PAID atau FREE?" and refuse `auto` for paid drops.
+
+---
+
+## MEDIUM Findings
+
+### M1. Optimism / Arbitrum L2 fee model differs â `eth_maxPriorityFeePerGas` works but `baseFeePerGas` semantics differ
+
+**Where:** `chain.rs:286` â `max_fee_per_gas = base_fee Ã 2 + priority_fee`.
+
+**What:**
+- **Arbitrum (42161):** Has EIP-1559 but baseFee updates slowly; the `Ã2` buffer is fine. However, Arbitrum also charges an L1 data-fee component that is **not reflected in `gas_price`**. A user setting `max_fee_per_gas` based on L2 baseFee alone will underprice the L1 component. Result: tx sits in L2 mempool, eventually drops or succeeds depending on congestion.
+- **Optimism (10):** Similar L1 data-fee issue. ECOTONE/Canyon upgrades changed the formula. Older formulas use `tx.gasPrice Ã estimatedL1GasUsed`, newer use `baseFee` differently.
+- **Base (8453):** Same as Optimism (OP-stack).
+
+**Exploit scenario:** User signs Arbitrum tx with `max_fee = 0.02 gwei Ã 2 = 0.04 gwei + priority`. L1 baseFee spikes to 50 gwei during a popular mint, tx underpriced, user retries with double gas, eventually overpays by 5x for inclusion.
+
+**Fix:** Add chain-specific L1-fee estimation for OP-stack and Arbitrum. For now, recommend `--max-fee 5x` for L2s in the wizard.
+
+---
+
+### M2. `wallet_snapshot` race: nonce captured in `submission_inputs` may not match `account_state`'s pending nonce on rapid chains
+
+**Where:** `chain.rs:201` (`wallet_snapshot`) â runs both batches in parallel via `tokio::join!`, then reconciles.
+
+**Good:** The reconciliation (`reconcile_wallet_snapshot`) catches mismatches and retries up to `WALLET_SNAPSHOT_MAX_ATTEMPTS = 2`. But on **high-throughput chains (Base during a hot mint)**, 2 retries may not be enough â the nonce can flip again between attempts.
+
+**Fix:** Bump retry cap to 5 OR add an exponential backoff between attempts. Document expected failure rate on hot mints.
+
+---
+
+### M3. `Robinhood-chain-pitfalls.md` admits `--fund` does not work, but `safe_mint.py` wizard will happily try
+
+**Where:** `references/robinhood-chain-pitfalls.md:34` ("`--fund` butuh EIP-7702 â TIDAK available di Robinhood").
+
+**What:** If the Rust CLI doesn't gate `--fund` by chain capability (no check of `eip7702_is_live`), the CLI builds the sponsored transaction, signs it, broadcasts, and pays gas for a tx that fails on-chain (no EIP-7702 transaction type supported pre-Fermi hard fork on RH chain).
+
+**Fix:** Probe `eip7702_is_live` at startup; refuse `--fund` if the chain doesn't support it.
+
+---
+
+### M4. `safe_mint.py` does not verify chainId matches before broadcast â only at `check` time
+
+**Where:** `references/security-first-mint-pipeline.md` "Safety Layers": *1. Chain lock â RPC chainId harus cocok dengan expected (4663 / 46630)* â appears only in `check`, not in `watch`.
+
+**What:** Between `check` and `watch` the user could swap RPC URL or env var. By the time `watch` fires, the chainId could be different.
+
+**Fix:** Re-validate chainId inside `watch` immediately before `eth_sendRawTransaction`. Reject if mismatch.
+
+---
+
+### M5. Explorer URL fallback to Basescan is silent
+
+**Where:** `src/chains.ts:113` â `DEFAULT_EXPLORER = "https://basescan.org"`.
+
+**What:** If a future chain is added to the OpenSea GraphQL but not to `CHAINS`, the explorer URL silently points to Basescan. A user verifying a tx hash from BSC by clicking the log link goes to a 404-looking Basescan page that may phish (none currently, but third-party tracking can replace the link).
+
+**Fix:** Return `null` from `resolveChain` for unknown chains, and have `explorerTx` print a warning instead of silently defaulting.
+
+---
+
+## LOW Findings
+
+### L1. `BlastResult` parsing in `rpc-blast.ts:91` uses `as any` cast for JSON
+
+**Where:** `src/rpc-blast.ts:91-93` â `(await s.value.json()) as any`.
+
+**What:** A malformed RPC response (HTTP 200 with HTML body from a captive portal) will throw and be caught silently â but the tx is already broadcast to the others. Not a security issue, just brittle.
+
+**Fix:** Type the response, validate `jsonrpc: "2.0"` and `error.code` shape, distinguish "JSON parse error" from "RPC error".
+
+---
+
+### L2. `chain.rs:189` (`submission_inputs`) hardcodes batch IDs `1, 2, 3`
+
+**Where:** Lines 189â218 â the JSON-RPC batch assigns IDs `1, 2, 3` for `getBlockByNumber`, `getTransactionCount`, `maxPriorityFeePerGas`.
+
+**What:** Some RPC providers (Infura free tier historically, some Alchemy tier configs) reject batches with duplicate IDs across calls, or with non-sequential IDs. Documented in `references/robinhood-chain-pitfalls.md:54` ("NodeFlare + osnm-z batch 3-call sering race"). The current code handles this via `BatchUnsupported` error.
+
+**Mitigation already in place.** Just noting the retry path (`5Ã12s` backoff in the curl proxy) is fragile.
+
+---
+
+### L3. `safe_mint.py` `os-check` reserves drop slots
+
+**Where:** `references/security-first-mint-pipeline.md`: *"`os-check --wallet` bisa RESERVE drop slot"*.
+
+**What:** Documented behavior, but if a user runs `os-check` during testing and then later attempts the actual mint, they may find the slot already consumed by their own probe. Funds not lost, but the mint fails.
+
+**Fix:** Already documented. Just ensure this is in red bold text in the wizard.
+
+---
+
+### L4. `safe_mint.py` `auto` mode + `confirm` mode are not password-locked at sign time
+
+**Where:** `safe_mint.py watch --password 'STRONG'` is documented; password env var `SAFE_MINT_PASSWORD` is also supported.
+
+**What:** If the process is killed mid-sign, the signed raw tx is in memory but the keystore file is already opened. Process resurrection + memory dump would leak the wallet. Mostly theoretical on modern Linux.
+
+**Fix:** Ensure keystore is reopened per-iteration (not cached across `--mode auto` retries).
+
+---
+
+## Chain-Specific Footguns Summary
+
+| Chain | Issue | Severity |
+|---|---|---|
+| **BSC (56)** | `eth_maxPriorityFeePerGas` support varies; some public RPCs omit `baseFeePerGas` | HIGH (H2) |
+| **Avalanche (43114)** | baseFee can be 0 on empty blocks â underpriced risk | MEDIUM |
+| **Polygon (137)** | Generally OK, but Boron's `eth_maxPriorityFeePerGas` is sometimes 0 â tx rejected | LOW |
+| **Arbitrum (42161)** | L1 data fee not in `max_fee_per_gas` | MEDIUM (M1) |
+| **Optimism (10)** | Same L1 data fee issue | MEDIUM (M1) |
+| **Base (8453)** | Same OP-stack | MEDIUM (M1) |
+| **Ethereum (1)** | Clean EIP-1559 â no footguns | OK |
+| **Robinhood (4663)** | EIP-7702 unavailable â sponsored mode dead; `--fund` will fail | MEDIUM (M3) |
+| **Solana** | Not actually supported by any of the 3 tools â only REST | CRITICAL (C3) |
+
+---
+
+## Final Verdict
+
+**NEEDS-FIX.** 
+
+The package is well-engineered on Ethereum/Base/Robinhood for self-funded single/multi-wallet mints. The cross-chain expansion to BSC, Polygon, Arbitrum, Optimism, Avalanche is **under-tested** â the same code that works on Base is being deployed to BSC where `eth_maxPriorityFeePerGas` and `baseFeePerGas` semantics differ, and the SeaDrop singleton address assumption is not verified per chain.
+
+**Must-fix before production on any chain beyond Ethereum/Base/Robinhood:**
+- **C1** (SeaDrop singleton verification per chain)
+- **H2** (legacy-tx fallback for chains with inconsistent EIP-1559 fields)
+- **H1** (chain selection vs provider chainId mismatch guard)
+
+**Should-fix before adding more chains:**
+- **C2** (EIP-7702 chain capability gate)
+- **H3** (multi-wallet nonce coordination)
+- **M1** (L2 L1-fee estimation)
+
+**Nice-to-have:**
+- M2, M4, M5, all LOW.
+
+The Rust `ChainGateway` is solid; the TS sniper is clean. The Python tool is the most mature for single-wallet safety but assumes Robinhood. The biggest concrete bug is **C1** â the rest are mostly missing-guard-rails, not active exploits.

@@ -1,0 +1,310 @@
+HTTP 200
+# REVIEW VERDICT: **NEEDS-FIX**
+
+The skill package is *largely* aligned with its claims and the design is reasonable for a single-wallet safety-first mint pipeline. But there are several real bugs that could cause **financial loss on mainnet** â primarily in the RPC pool, broadcast/dedup logic, and a critical ABI-encoding error that will make the script sign a malformed transaction for the very common 2-arg `mintPublic(quantity, nftContract)` call. Plus docs drift and a few security smells. Below are concrete findings.
+
+---
+
+## 1. CODE CORRECTNESS â REAL BUGS
+
+### ð´ CRITICAL â `abi_encode_call` uses the **wrong hash** for the selector
+
+```python
+def abi_encode_call(sig: str, args: list[Any]) -> str:
+    selector = (
+        hashlib.sha3_256(sig.encode("ascii")).hexdigest()[:8]
+    )
+```
+
+`hashlib.sha3_256` in Python is **NIST SHA3 (FIPS 202)**, not Ethereum's Keccak-256. Ethereum's `function selector = keccak256(sig)[0:4]`. NIST SHA3 and Keccak-256 share the same permutation but differ in padding (NIST uses 0x06, Keccak uses 0x01), so the resulting digests are different for *every* signature.
+
+This function is the **only** path that consumes `--function-call` (the very example shown in `SKILL.md` and the reference doc â `mintPublic(uint256,address)`). If a user passes calldata via `--function-call` (instead of pre-computed `--data`), the script will compute a wrong selector, sign a tx to a non-existent method, and burn gas on a revert. The other helper, `encode_function_call(selector_hex, *args)`, takes the correct selector directly, so a power user can sidestep this â but the doc advertises the broken path.
+
+Also worth noting: even if you fixed the hash to Keccak, `abi_encode_call` is a **broken ABI encoder** for any type that's not a static scalar (`address`, `uint256`, `bool`, literal `bytes32`). It has no support for dynamic types, no offset table, no nested tuple encoding. The function is more dangerous than helpful because it *appears* to work for the doc's example signature.
+
+### ð´ CRITICAL â `broadcast_same_raw` dedup logic returns a **wrong hash**
+
+```python
+if "already known" in msg or "known transaction" in msg or "nonce too low" in msg:
+    return "0x" + hashlib.sha3_256(bytes.fromhex(raw_hex.removeprefix("0x"))).hexdigest()
+```
+
+Two problems:
+
+1. **Wrong hash algorithm**: again `sha3_256` (NIST SHA3), not Keccak-256. The actual `tx_hash` returned by the Ethereum JSON-RPC is `keccak256(rlp_encoded_signed_tx)`, not any hash of the raw concatenated RLP fields. This means after the first endpoint returns `already known`, the recorded "tx_hash" in SQLite is **completely wrong**, and:
+   - `eth_getTransactionReceipt(tx_hash)` in the receipt loop will never find it,
+   - state is recorded as `BROADCAST` / `PENDING` / `FAILED` against a hash that doesn't exist on chain,
+   - the duplicate guard will fire forever (same bogus hash pattern in any future comparison logic â though fortunately the dedup key is wallet+contract, not tx_hash).
+
+2. **`nonce too low` is NOT an "already known" condition.** It's a fatal sign error â the nonce was already consumed by an earlier tx. Treating it as "we already sent this" silently masks the real problem and lets the script report success when in fact the tx was rejected by the node. Worst-case, the user's earlier tx was a real mint that succeeded, the nonce is now stale, and this script claims it sent *this* tx successfully while it actually didn't.
+
+3. `"nonce too low"` lowercased against the full SafeMintError message also matches `nonce too low` from the *other* endpoint's pool view of mempool â but that doesn't make the second broadcast a success; it makes it a rejected retry.
+
+The intent of this branch is salvageable, but the implementation is wrong on every input.
+
+### ð´ CRITICAL â `validate()` only runs once and never re-checks; cache poisoning on chain switch
+
+```python
+def validate(self) -> list[EndpointHealth]:
+    if self._ranked_cache is None:
+        for url in self.urls:
+            self.probe(url, validate=True)
+        ...
+        self._ranked_cache = sorted(...)
+    return self._ranked_cache
+```
+
+This is correct for a single-session use, but `RPCPool` has no method to **invalidate** `_ranked_cache`, and the `broadcast_same_raw` branch and the hot `call` branch both rely on `validate()` returning the cache. If the first probe of *any* endpoint succeeds while the chain check is disabled-by-config, subsequent calls will keep using a poisoned ranking. Not the most likely loss path â but more importantly, the doc claims *"Live demotion â endpoint gagal dalam sesi dipindah ke belakang ranking"*. The live demotion code in `call()` mutates `_ranked_cache`, but if `validate()` was called and the cache was *just built*, the demotion only reorders within an already-validated set. An endpoint that *was* healthy at probe time but goes down mid-session: the demotion works. â
+
+What does NOT work: an endpoint that was healthy at probe time but **returns wrong data** (e.g., a fork RPC serving a different chain). The cache says "validated", we never re-check. For a mint pipeline that picks "the best" once and trusts it for nonce/balance/chainId for the rest of the run, a stale/wrong-cache endpoint means wrong nonce, wrong balance, possibly wrong chain-id â wrong signed tx.
+
+The `run_watch` function does call `validate_chain(primary, int(chain_hex, 16))` *after* the trigger, so chain-lock is re-checked at fire time â this is good. But `eth_getTransactionCount`, `eth_getBalance`, and `eth_call` are **not** re-validated against the chain at fire time; they go to the same pool. If the top-ranked endpoint has been hijacked/poisoned post-probe, all four could be lying. Mitigation would be: re-probe after the trigger, or pin a single validated endpoint for fire-time calls.
+
+### ð  HIGH â `decode_uint256` interprets all return words as `uint256`; `mint_price` is `uint80`
+
+```python
+def probe_public_drop_price(client: RPCClient, contract: str) -> dict[str, Any]:
+    ...
+    mint_price = decode_uint256(result, 0)
+    start_time = decode_uint256(result, 1)
+    end_time = decode_uint256(result, 2)
+    max_wallet = decode_uint256(result, 3)
+    fee_bps = decode_uint256(result, 4)
+```
+
+The ABI declares all five return fields with non-256 widths: `uint80 mintPrice`, `uint48 startTime`, `uint48 endTime`, `uint16 maxTotalMintableByWallet`, `uint16 feeBps`. With Solidity's ABI encoding for tuples of these widths, the encoder **packs them into two 32-byte words** (one for mintPrice, one for the four smaller fields), not five. This is the standard "tail-encoding" optimization for small-typed tuple fields.
+
+If the actual SeaDrop returns `(mintPrice=0.01e18=10000000000000000 wei, startTime=..., endTime=..., maxPerWallet=1, feeBps=500)`:
+- word 0 = `mintPrice` padded to 32 bytes â
+- word 1 = `endTime || startTime || mintPrice?` ... actually for `uint80,uint48,uint48,uint16,uint16` the encoder packs as `(startTime<<208)|(endTime<<160)|(maxPerWallet<<144)|(feeBps<<128)` into one word and a separate word for the upper bits of `mintPrice` that don't fit in 80 bits.
+
+The script reads word 1 as `startTime` â for a future-dated mint this will be **garbage** (the high bits of mintPrice). It will also read word 4 (which doesn't exist in this encoding) as `fee_bps` â guaranteed to be 0 or junk. Most importantly:
+
+**`mint_price` for a non-zero value may actually be correct in this case because `uint80` can hold the whole value within 32 bytes**. But the comparison `if mint_price == 0` only works correctly for values that fit in 80 bits AND zero values that produce the expected packed layout. For real values around `0.01 ETH` (~10^16 wei), they fit fine. But the code prints "FREE" if `mint_price == 0` and "PAID" otherwise. With a paid mint at 0.01 ETH, the printed price will be the correct value. So the price field itself is **probably OK** for typical values.
+
+The bigger risk is that `start_time`, `end_time`, `max_per_wallet`, `fee_bps` will be **wrong** because of the wrong word offsets. The script only uses these for logging, so no direct loss â but if you ever extended it to gate execution on `start_time`, you'd be acting on garbage. Also, the doc claim "closes the token=0 trap" depends only on `mint_price == 0`, which works for zero values, so the headline guarantee holds â but is fragile.
+
+### ð  HIGH â `encode_function_call` for `mintPublic(uint256,address)` produces a **too-short** payload if anyone ever does use it via the right selector path
+
+`encode_function_call(selector_hex, *args)` builds `selector + words`. For `mintPublic(uint256,address)` with args `1, 0x<addr>`:
+- word 1 = `0x0000...0001`
+- word 2 = `0x0000...<addr>`
+That's 4 + 32 + 32 = 68 bytes (136 hex chars). â Correct.
+
+But this function only handles scalar 32-byte words. It will fail with `SafeMintError("Unsupported arg ...")` on anything else, and it never validates `int` arguments for negative numbers (Python ints are arbitrary-precision and the `& ((1<<256)-1)` mask *does* truncate correctly, but the user has no warning). Borderline acceptable.
+
+### ð¡ MEDIUM â `already_broadcast` is *too lenient* AND *too strict* simultaneously
+
+```python
+"SELECT 1 FROM runs WHERE wallet=? AND contract=? AND state IN ('BROADCAST','CONFIRMED','FAILED')",
+```
+
+Three problems:
+
+1. A `FAILED` tx permanently blocks all future attempts for that wallet+contract. SeaDrop mint failures (out of stock, wrong stage, etc.) shouldn't be permanent â the user might legitimately want to retry on a different stage or after a refund/availability change. They have to manually clear the DB. The doc says *"Use a fresh keystore/wallet or clear the state DB deliberately"* but for any normal user, this is a footgun.
+
+2. The guard uses `wallet.lower()` and `contract.lower()` correctly â â.
+
+3. There's no recorded `attempt_id` distinguishing mints by stage or contract-version. If a project redeploys the same address with a new drop, you're permanently locked out. Acceptable design trade-off given the single-wallet scope, but worth a doc note.
+
+### ð¡ MEDIUM â `eth_call` is called with `"pending"` block tag for *simulation*
+
+```python
+primary.call("eth_call", [call_obj, "pending"])
+```
+
+This is fine for pre-trigger warm polling (you want to know whether the tx *would* succeed in the next block). But the same call is repeated *after* the trigger for "Mandatory final simulation" with the same `"pending"` tag. After the trigger, the tx should be simulated at `"latest"` to catch any state change between trigger and fire. Not a loss risk per se, but the doc claim "Mandatory eth_call simulation before signing" is technically true but the simulation block tag is the optimistic one.
+
+### ð¡ MEDIUM â `primary` is the entire pool, not a single endpoint
+
+```python
+primary = pool  # pool.call() fails over automatically
+```
+
+This is fine for read-only calls, but for the **post-trigger critical calls** (`eth_getTransactionCount`, `eth_gasPrice`, `eth_getBalance`), the call could land on **a different endpoint** than the one that detected the trigger. If the two endpoints have different mempool views (different `pending` nonces), the script signs with a nonce that conflicts with the other endpoint's view. For a mint pipeline that wants a single source of truth, this is fragile.
+
+Mitigation: after the trigger, pin a single endpoint for the nonce/gas/balance/receipt/chainId calls. The pool is great for the warm poll (where failover on transport errors matters) but bad for the moment-of-fire (where consistency matters).
+
+### ð¡ MEDIUM â `--max-price` default is `"0"` but `--value` default is `"0"` too; this means a *paid* mint with `--value 0.01` and `--max-price 0` will hard-fail at `enforce_limits`
+
+User intent vs. flag intent clash. The doc says "For pure-free SeaDrop, leave --value 0 and it will still enforce max-price 0" â i.e., the script actively refuses to broadcast a paid tx if `max-price` is left at default `0`. This is a deliberate safety default but means a user running `watch --value 0.01 --max-price 0` will hit `LimitViolation("Current mint value 0.01 ETH exceeds max NFT price 0 ETH")`. They then have to read the error to discover they need `--max-price 0.01`. Not a bug, but the doc doesn't warn loudly enough.
+
+### ð¢ LOW â `pool.call(...)` is called via `RPCClient.call(...)` underneath, but RPCClient does **not** retry on `429` from the pool path
+
+Wait â it does: `RPCClient.call` retries 6Ã with 11s backoff. â For a NodeFlare 1 req/10s limit, this means a single failed call can take 6Ã11 = 66 seconds before giving up. In a hot polling loop with `poll-interval 175`, you'll accumulate requests faster than you can retry. The `RATE_LIMIT_RETRIES = 6` Ã `RATE_LIMIT_BACKOFF = 11.0` = 66s per failed call. If the warm poll triggers during a 429, you'll be stuck in backoff for over a minute on every poll iteration. This is the doc's acknowledged limitation ("Polling efektif ~10s per iterasi"), so not a bug, but a `429` inside a hot polling loop with this retry config will make `watch` essentially unusable for the duration of the rate-limit window.
+
+Mitigation would be: detect 429 early, immediately skip the endpoint for the duration of the window, fail over to the next ranked endpoint. Right now the endpoint is hit, fails, backs off 11s, retries, fails again, etc.
+
+---
+
+## 2. SECURITY
+
+### â Good practices that are correctly implemented
+
+- Keystore file mode `0o600`, parent directory mode `0o700`, atomic write via `.tmp` + `replace`. Correct.
+- `Account.encrypt` / `Account.decrypt` from `eth-account` â standard Web3 secret storage.
+- `unlock_account` doesn't cache the unlocked key in any global; the local `account` variable is the only reference and goes out of scope at function return. â
+- `redact()` correctly strips private keys from RPC error bodies (`(0x[a-fA-F0-9]{4})[a-fA-F0-9]{40,}`). â
+- `redact()` strips OpenSea API keys (`sk-...`). â
+- Chain ID is validated at `validate_chain` and re-validated inside `run_watch` after the trigger. â
+- Mandatory simulation + `estimateGas + 15% buffer` before signing. â
+- Local signing only; raw bytes broadcast to RPCs. â
+
+### ð¡ MEDIUM â Password passed on the command line is visible in `ps`
+
+Every subcommand that takes `--password` exposes the keystore password to `/proc/<pid>/cmdline` for the lifetime of the process (and any child processes). On a shared host this is a leak. The doc could recommend `read -s` + env var or a prompt. The script uses `input()` only for the `[y/N]` confirm prompt, never for the password. This is a real-world ops security gap, not a code bug, but worth a fix or doc note.
+
+### ð¡ MEDIUM â `state_db()` uses `~/.nft-safe-mint/` with mode `0o700`, but inside `record_run` the `tx_hash` is stored without redaction. SQLite WAL/SHM files contain the same. Acceptable for an op-sec tool the user controls; mention only as a hardening note.
+
+### ð¢ LOW â `checksum_address` uses SHA3-256 (NIST), not Keccak-256, for EIP-55
+
+```python
+digest = hashlib.sha3_256(addr.encode("ascii")).hexdigest()
+```
+
+EIP-55 specifies **Keccak-256** (the original, pre-NIST). NIST SHA3 and Keccak-256 produce different hashes, so this function produces **non-EIP-55 checksums**. Two practical consequences:
+
+1. Any downstream system that validates EIP-55 checksums against this script's output will reject it.
+2. Any system that rejects EIP-55-invalid addresses (e.g., some exchanges) will refuse to send to these "checksums".
+
+The checksum is mostly cosmetic (the address bytes are correct â only the capitalization differs), and the contract address being checksummed is one the user already provided, so this is a minor issue. But it's another instance of the recurring "wrong hash function" pattern across this file.
+
+### ð¢ LOW â `URL_PATTERNS` redaction regex strips basic auth credentials but breaks URLs without `user:pass@` cleanly. Acceptable; not a security finding.
+
+---
+
+## 3. DOCS-VS-CODE DRIFT
+
+The reference doc and SKILL.md mostly match the argparse, with these specific mismatches:
+
+### Drift 1 â Default `--backup` flag changes semantics between `check`/`watch`/`rpc-test`
+
+The argparse defines:
+```python
+ck.add_argument("--backup", default=",".join(DEFAULT_RH_RPCS[1:]), ...)
+```
+
+So `--backup` defaults to a comma-joined string of all backup URLs, which gets split by `args.backup.split(",")`. This works for `watch` and `rpc-test` (which split on comma), but `check` does:
+```python
+urls = [args.rpc] + ([u for u in (args.backup or "").split(",") if u.strip()] if args.backup else [])
+```
+
+OK, this is consistent. â My mistake â no drift.
+
+### Drift 2 â `--max-total` is a **required argument** to `check` in the doc, optional in code
+
+Doc example:
+```bash
+python3 safe_mint.py check --rpc ... --contract 0x... --max-total 0.001
+```
+
+Code:
+```python
+ck.add_argument("--max-total")  # no `required=True`
+```
+
+The code uses `args.max_total` only inside `if args.max_total:` â so it's optional. â Not really drift, but the doc implies it's required.
+
+### Drift 3 â `--keystore` is described as required for `check` in the doc table
+
+Doc:
+> | 2 | Pre-flight check: chain, contract code, free-mint price, balance vs limits |
+
+argparse: `ck.add_argument("--keystore")` â optional. If omitted, the code skips the balance/limits check entirely. Drift: the doc's "balance vs limits" guarantee only fires when `--keystore` is passed. A user running the doc example without `--keystore` will think they've checked balance when they haven't.
+
+### Drift 4 â `os-check` argparse declares `--api-key` and `--wallet` and `--quantity`, but the **default** quantity is `1` and is used unconditionally
+
+```python
+oc.add_argument("--quantity", type=int, default=1)
+```
+
+Then:
+```python
+mint = client.build_mint(slug, args.wallet, args.quantity)
+```
+
+`build_mint` is always called even when `--wallet` is not provided, because the `if not args.wallet: return 0` check is *after* `get_drop(slug)` but `build_mint` is only called after the early return. â Actually correct.
+
+But: `build_mint` makes a `POST /drops/{slug}/mint` call. The doc says `os-check` is "no broadcast, just verify value == 0 + chain". But by default, **with no `--wallet` flag**, it does *not* call `build_mint`, just verifies the drop metadata. With `--wallet`, it issues a POST. OpenSea's `/mint` endpoint may actually **queue / reserve** a mint slot on their side (this is how OS mint endpoints typically work). This isn't "broadcast" but it does consume an OS-side resource per call. Worth flagging in the doc.
+
+### Drift 5 â Doc says `watch` examples include `--mode auto`, but never warns that **`auto` has no confirmation prompt**
+
+Code:
+```python
+if mode in {"watch", "dry-run"}:
+    ...
+if mode == "confirm":
+    answer = input("Simulation + limits pass. Broadcast now? [y/N] ")
+    if answer not in {"y", "yes"}:
+        ...
+```
+
+`auto` falls through both checks â unconditional broadcast. Doc:
+> Watch mode di `confirm` = bakal nanya "Broadcast now? [y/N]" sebelum sign
+
+Doesn't mention that `auto` skips the prompt. This is a real safety regression for any user who types `--mode auto` thinking it's safer.
+
+### Drift 6 â Doc shows `"mintPublic(uint256,address)" '1' '0x..'` example
+
+The argparse has `--function-call` but it's just a string. The code never parses it:
+```python
+data = args.data if args.data else args.function_call
+```
+
+So `--function-call` is treated as raw hex calldata (not split into sig + args). The user would have to manually compute the selector + ABI-encode args and pass the result as a single hex string into `--function-call`. The doc example as-written won't work. **This is the same bug as Section 1 critical finding 1** â the doc implies the script will do the encoding for you, but `abi_encode_call` is broken (wrong hash + incomplete encoder), and `cmd_watch` doesn't even invoke it.
+
+### Drift 7 â Doc claim "openSea Drops API tx build + chain/value validation (optional os-mode)"
+
+The script doesn't have an "os-mode". `os-check` is its own command, not a mode. Minor terminology drift.
+
+---
+
+## 4. MISSING / WEAKNESSES â gaps vs the "10 strengths" table
+
+| # | Strength | Status | Notes |
+|---|----------|--------|-------|
+| 1 | Encrypted Web3 keystore (mode 600) | â | Correctly implemented |
+| 2 | Chain ID validation | â | Re-checked after trigger. Good. |
+| 3 | Mandatory eth_call simulation | â but | Uses `"pending"` block tag, not `"latest"` at fire time. |
+| 4 | eth_estimateGas + 15% buffer | â | `int(int(gas_hex, 16) * 1.15)`, minimum 21000. â |
+| 5 | Hard spending limits | â | Well-implemented. Default `max-price=0` makes the script refuse any paid mint, which is a strong safety default. |
+| 6 | Duplicate guard | â ï¸ | Includes `FAILED` state â permanent block on retry. Probably over-blocking. |
+| 7 | Watch-then-fire | â ï¸ | 429 retry policy (66s+ per call) makes the watch loop unusable during rate-limit windows on NodeFlare. Polling 175ms against a 10s rate limit means you'll burn retries faster than you can succeed. |
+| 8 | On-chain free-mint verification | â ï¸ | ABI decode of `getPublicDrop` is wrong for non-zero `mintPrice` because the tuple uses packed encoding, not five separate 32-byte words. Works for `mintPrice==0` (the doc's headline use case), fails for paid mints. |
+| 9 | OpenSea Drops API validation | â | Domain check, chain check, value check. |
+| 10 | Double broadcast | ð´ | Dedup hash uses NIST SHA3, not Keccak-256. "nonce too low" mishandled. Wrong hashes recorded. |
+| + | Rate-limit retry | â ï¸ | Aggressive retry policy during watch hot loop. |
+
+### Missing: chain re-validation at fire time on every endpoint
+
+The script validates the chain on the **first** endpoint at probe, then again on `primary` (the pool) at fire time. But if the pool's top-ranked endpoint silently serves a fork or stale chain, you never notice. Adding `validate_chain` per endpoint at fire time would harden this.
+
+### Missing: nonce management under parallel calls
+
+`eth_getTransactionCount(addr, "pending")` is called once at fire time and the resulting nonce is used in the signed tx. If during the watch loop any other process sent a tx from this wallet, the nonce may be stale by the time we fire. The script has no mechanism to detect or recover. For a single-wallet single-mint use case this is acceptable; for multi-process pipelines, it's a footgun.
+
+### Missing: private-key zeroization
+
+`Account.from_key(key)` returns an object that internally holds the key bytes; the local `key` variable in `unlock_account` is overwritten on next call. There's no `memset` / `bytearray` zeroization. Standard Python caveat â no reliable way to scrub memory. Worth a doc note but not fixable in pure Python.
+
+---
+
+## 5. VERDICT
+
+**NEEDS-FIX.** This skill is not safe to ship to mainnet without addressing the following must-fix items:
+
+### Must-fix (will lose money or leak keys)
+
+1. **Replace `hashlib.sha3_256` with `eth_utils.keccak`** (or `Crypto.Hash.keccak`) in:
+   - `abi_encode_call` selector computation,
+   - `checksum_address` EIP-55,
+   - `broadcast_same_raw` dedup hash.
+   
+   Fix the underlying Keccak-vs-NIST-SHA3 confusion. This alone makes the `os-check` POST-dedup path and any `--function-call` use unsafe.
+
+2. **Fix `broadcast_same_raw` dedup logic**:
+   - Return the **actual** `eth_sendRawTransaction` result hash from the first successful endpoint.
+   - Only treat `"already known"` / `"known transaction"` as success-of-second-broadcast, never `"nonce too low"`.
+   - On `"nonce too low"`, raise â this is a fatal sign error.
+
+3. **Fix `probe_public_drop_price` ABI decoding** for SeaDrop's `PublicDrop` tuple. Use the correct packed-encoding offsets, or call via `eth_call` returning `(uint80,uint48,uint48,uint16,uint16)`

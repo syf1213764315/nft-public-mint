@@ -88,13 +88,14 @@ export function resolveChain(
 }
 
 // Build a block-explorer tx URL for whatever chain we're on. Accepts either the
-// numeric chainId (preferred — it's authoritative) or the chain key. Falls back
-// to Basescan for unknown chains so links are never broken silently.
+// numeric chainId (preferred — it's authoritative) or the chain key. Returns
+// null for unknown chains — callers must surface a warning instead of silently
+// pointing at a wrong-chain explorer (M5 in full-skill review).
 export function explorerTx(
   idOrKey: string | number | bigint | null | undefined,
   txHash: string
-): string {
+): string | null {
   const profile = resolveChain(idOrKey);
-  const base = profile?.explorer ?? DEFAULT_EXPLORER;
-  return `${base}/tx/${txHash}`;
+  if (!profile) return null;
+  return `${profile.explorer}/tx/${txHash}`;
 }

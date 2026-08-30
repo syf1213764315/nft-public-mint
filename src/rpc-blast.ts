@@ -12,6 +12,13 @@ export interface BlastResult {
   error: string | null;
 }
 
+// L1: typed JSON-RPC response so we don't cast 'as any'
+interface RpcResponse {
+  jsonrpc?: string;
+  result?: string;
+  error?: { code?: number; message?: string };
+}
+
 // Parse RPC URLs and assign labels
 export function parseRpcEndpoints(rpcUrls: string[]): RpcEndpoint[] {
   return rpcUrls.map((url, i) => ({
@@ -93,7 +100,7 @@ export function blastToAll(
       const s = settled[i];
       if (s.status === "fulfilled") {
         try {
-          const json = (await s.value.json()) as any;
+          const json = (await s.value.json()) as RpcResponse;
           if (json.result) {
             console.log(chalk.green(`  [${i}] ${ep.label}  TX: ${json.result}`));
             results.push({ label: ep.label, txHash: json.result, error: null });
@@ -105,6 +112,11 @@ export function blastToAll(
               console.log(chalk.red(`  [${i}] ${ep.label}  ERR: ${errMsg}`));
             }
             results.push({ label: ep.label, txHash: null, error: errMsg });
+          } else {
+            // L1: non-conforming RPC response (captive portal HTML, proxy junk)
+            const raw = JSON.stringify(json);
+            console.log(chalk.red(`  [${i}] ${ep.label}  ERR: unexpected RPC response ${raw.slice(0, 120)}`));
+            results.push({ label: ep.label, txHash: null, error: `unexpected RPC response: ${raw.slice(0, 120)}` });
           }
         } catch (err: any) {
           console.log(chalk.red(`  [${i}] ${ep.label}  ERR: ${err.message}`));

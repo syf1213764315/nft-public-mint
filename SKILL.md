@@ -1,6 +1,6 @@
 ---
 name: nft-public-mint
-description: "NFT mint arsenal — 2 tools: (1) nft-public-mint TS sniper for public SeaDrop mints (on-chain calldata, no OpenSea API, pre-sign + multi-RPC blast, Ethereum/Base/Robinhood); (2) osnm-z Rust pro CLI for WL/FCFS/public via OpenSea private API — multi-wallet self-funded (≤10) & sponsored EIP-7702 (≤25), eligibility check, tx replacement, wallet gen/fund/withdraw."
+description: "NFT mint arsenal — 2 tools: (1) nft-public-mint TS sniper for public SeaDrop mints (on-chain calldata, no OpenSea API, pre-sign + multi-RPC blast, Ethereum/Base/Robinhood); (2) osnm-z Rust pro CLI for WL/FCFS/public via OpenSea private API — multi-wallet self-funded (≤10) & sponsored EIP-7702 (≤25), eligibility check, tx replacement, wallet gen/fund/withdraw. Plus opensea-rest/ (merged from ProjectOpenSea/opensea-skill v2.20.0): full OpenSea REST API client (64 scripts) — drops, collections, NFTs, tokens, real-time stream, Seaport fulfillment, free-mint REST scanner."
 category: crypto
 metadata:
   hermes:
@@ -13,6 +13,11 @@ metadata:
       - When you need to avoid OpenSea API rate limits
       - Allowlist/FCFS/private stage mints (osnm-z)
       - Sponsored EIP-7702 multi-wallet minting (osnm-z)
+      - Querying drops, collections, NFTs, tokens via OpenSea REST API (opensea-rest/)
+      - Discovering free mints with official REST scanner (opensea-rest/scripts/osa_free_scan_rest.py)
+      - Real-time mint/listing monitoring via WebSocket stream (opensea-rest/scripts/stream/)
+      - Pre-mint analysis: collection stats, floor prices, holders, token OHLCV
+      - Building Seaport fulfillment data (buy/sell) via REST (opensea-rest/scripts/)
     when_not_to_use: |
       - Non-SeaDrop contracts (custom mint contracts need manual calldata)
 ---
@@ -24,7 +29,15 @@ Dua tool dalam satu skill:
 1. **nft-public-mint** (Node/TS) — fast local sniper untuk public SeaDrop mint. Calldata dibangun on-chain, tanpa OpenSea API, tanpa rate limit. Pre-sign sebelum stage buka, blast ke semua RPC.
 2. **osnm-z / opensea-mint** (Rust) — pro CLI untuk WL/FCFS/public via OpenSea private API. Multi-wallet self-funded (≤10) & sponsored EIP-7702 (≤25), eligibility check, tx replacement, wallet generator, fund/withdraw.
 
-> **Routing:** lihat `references/tool-comparison.md`. Singkatnya: public FCFS → nft-public-mint (lebih cepat, bebas API drift); WL/private stage → osnm-z (satu-satunya yang bisa); banyak wallet → osnm-z.
+> **Security-first mint pipeline (port dari Robinhood-nft-sniper):** `scripts/safe_mint.py` — Python CLI dengan encrypted Web3 keystore, hard spending limits, mandatory eth_call simulation sebelum sign, duplicate guard, watch-then-fire engine, free-mint on-chain verification (getPublicDrop().price == 0 — fix "token=0 trap"), OpenSea validator, dan **RPCPool** (multi-endpoint health-ranked: probe sekali + cache, failover transport error, negative cache untuk method yang di-reject -32601, live demotion, 429 = transport, `invalidate()`/`best_client()` pin fire-time reads, `--function-call` parsing). Reviewed by MiniMax M3 2026-08-30 — ALL findings fixed (keccak vs sha3_256 CRITICAL fix, nonce-too-low raise, FAILED-state retry, max-price 0 = no limit, SAFE_MINT_PASSWORD env). Routing: `references/security-first-mint-pipeline.md`. Commands: `keystore`, `check`, `os-check`, `watch`, `rpc-test`. **Default RPC (tanpa --rpc): NodeFlare primary (`rpc.nodeflare.app/robinhood/public` — satu-satunya full-method, 1 req/10s) + DRPC backup (`robinhood.drpc.org` — broadcast/receipt only). Gunakan `check` atau `os-check` SEBELUM mint apapun — ini mencegah kerugian akibat mint berbayar yang dikira free.**
+>
+> **Routing:** lihat `references/tool-comparison.md`. Singkatnya: public FCFS → nft-public-mint (lebih cepat, bebas API drift); WL/private stage → osnm-z (satu-satunya yang bisa); banyak wallet → osnm-z; safety-first pre-flight → safe_mint.py.
+>
+> **Multichain RPC:** `references/multichain-rpc-reference.md` (merged dari febfrmn/nft-s + osnm-z chains.ts) — 8 EVM chain + solana: chainId, blast RPCs, send-only sequencers, Alchemy templates, explorer. Probe `wl_bypass_probe.py` support `--chain <name>` buat pindah chain.
+>
+> **Cari NFT free yang lagi LIVE di OpenSea (per chain):** `scripts/osa_free_scan.py <chain-keyword>`. Filter `chain.identifier == "robinhood"` (atau `ethereum/base/...`), terus query `dropBySlug` GraphQL POST (non-persisted — APQ hash cuma untuk query lengkap osnm-z), filter stage `now ∈ [startTime, endTime]` + `eligiblePrice.token.unit == 0` (kalau field null = UN-AUTH GraphQL, bukan free). Output: slug + address + stage info. **Aturan user: khusus free mint, jangan nembak paid collection.**
+>
+> **OpenSea REST API arsenal (merged dari ProjectOpenSea/opensea-skill v2.20.0):** `opensea-rest/` — client curl+jq lengkap (64 script) buat query drops/collections/NFTs/tokens via official REST API + real-time WebSocket stream + Seaport fulfillment_data. Instant free key (600 read/h, 7-day expiry). Scanner REST: `opensea-rest/scripts/osa_free_scan_rest.py` (filter `price == 0`, bedain `PUBLIC-FREE` vs `NEEDS-ALLOWLIST`). Routing lengkap + key setup: `opensea-rest/SKILL.md`. Sifatnya query-only (bukan eksekusi mint — itu tetep osnm-z / sniper).
 
 ## Instalasi (nft-public-mint)
 
@@ -123,18 +136,49 @@ Install [Node.js 18+](https://nodejs.org) dan [Git](https://git-scm.com/download
 
 ## Automation Pattern
 
-Untuk cron / auto-mint:
+Untuk cron / auto-mint / bot wrapper, kedua CLI bisa di-drive non-interaktif via
+piped stdin (line-based wizard, bukan raw-mode TUI — gak butuh node-pty).
+Prompt order lengkap + blank-answer gotchas + pola Telegraf bot wrapper lengkap ada
+di `references/non-interactive-drive.md`.
 
 ```bash
 cd ~/.hermes/skills/nft-public-mint
-echo "PRIVATE_KEY_1\nPRIVATE_KEY_2\n\n" | npm start
+printf '%s\n' "$PK" '' 'base' '1' '0x<NFT-ADDRESS>' '' '' '' 'now' | npm start
 ```
 
-Tapi wizard lebih reliable untuk manual mint karena ada konfirmasi `Fire?` sebelum broadcast.
+Tapi wizard interaktif lebih reliable untuk manual mint karena ada konfirmasi `Fire?`
+sebelum broadcast.
 
 ## Advanced: Add Chain
 
 Edit `src/chains.ts` — tambah satu entry, no other code changes needed.
+
+## SeaDrop Drop Triage — Sebelum Mint
+
+Jangan langsung nembak. **Classify tipe kontrak DULU**: kalau `eth_getCode`
+panjang 92 byte (minimal proxy, bukan ERC-1967) → kemungkinan OpenSea Studio
+Drop, BUKAN SeaDrop — semua view function SeaDrop akan revert dan eligibility
+cross-chain dicek backend OpenSea (bukan on-chain). Triage lengkap tipe ini:
+`references/opensea-studio-drop-triage.md`.
+
+Setelah tahu tipe-nya SeaDrop → probe config on-chain untuk tahu jalur mana yang
+ADA dan mana yang buntu. Metodologi lengkap: `references/seadrop-drop-triage.md`.
+
+**Reusable probe (1 command):**
+```bash
+python3 ~/.hermes/skills/nft-public-mint/scripts/seadrop_probe.py 0x<NFT_CONTRACT> [0x<MODULE>] [0x<WALLET>] [RPC_URL]
+```
+
+Dump semua config: publicDrop (harga, jam buka, fee lock), allowlist merkle root,
+token-gated allowed tokens, signers, signed validation params, active stage,
+fee recipients, mint stats, supply.
+
+Yang dicek:
+- **merkleRoot == 0x0** → allowlist mati
+- **allowedTokens == []** → token-gated mati
+- **restrictFeeRecipients == true** → fee terkunci, gak bisa redirect
+- **getActiveStage revert** → stage tidak aktif
+- **Snapshot sudah lewat** → beli token gate sekarang gak ngaruh (saldo diukur di snapshot)
 
 ## License
 
@@ -239,3 +283,45 @@ opensea-mint doctor                # validasi config + RPC + mode
 - WL/private stage butuh OpenSea auth (SIWE) — tool handle otomatis, tapi butuh OpenSea account yang eligible.
 - EIP-7702 delegation **persist setelah tx** — wajib `--undelegate` setelah selesai, termasuk kalau batch revert.
 - Fee model: sponsored = sponsor bayar gas batch, tiap wallet masih wajib pegang `mint price × quantity` + OpenSea action reserve (`GAS_LIMIT × max fee`).
+
+### Pitfalls (lesson learned)
+
+- **`eligiblePrice.token.unit == 0` = free, `null` = UN-AUTHED** — GraphQL `dropBySlug` field `eligiblePrice` return null kalau wallet belum SIWE/authenticated. Bukan berarti free. Cara pasti cek free: `osnm-mint mint` (yg authorize + decode) output `token=0` di stage header, atau on-chain `getPublicDrop(nftContract)` view call.
+- **"exceeds allocation or supply limit"** — kode GraphQL `MintLimitExceeded`
+  → `InsufficientMintsRemainingError` di `src/opensea.rs` line 195.
+  Penyebab paling umum di RH chain: **SOLD-OUT (`totalSupply == maxSupply`)**,
+  OpenSea UI masih nampilin "available" karena cache stale. BUKAN cross-drop
+  wallet block (cross-drop biasanya muncul sebagai `MintActionRejected` /
+  `MintWalletIneligible`). Diagnostik: probe `totalSupply()` & `maxSupply()`
+  on-chain — kalau sama, drop habis. Cara pasti verifikasi sebelum
+  troubleshoot wallet: panggil `getPublicDrop(contract)` view + `totalSupply()`.
+- **"RPC endpoint 1 does not support the required three-read JSON-RPC batch"** — NodeFlare batch `eth_getBlockByNumber + eth_getTransactionCount + eth_maxPriorityFeePerGas` intermittent. Root cause: rate limit (1 req/10s) atau reqwest connection pool reset. Retry after 12s biasanya lulus. Kalau persistent: turunin `OPENSEA_CALLDATA_MAX_ATTEMPTS` (default 40 = banyak round-trip) atau switch ke DRPC/sequencer (tapi DRPC `-32601` di `eth_maxPriorityFeePerGas`).
+- **APQ hash `e1b54354...` cuma untuk query lengkap osnm-z** — kalo lo modifikasi query (tambah field, rename), persisted query hash invalid → 400 Bad Request. Pakai POST non-persisted (`{"query": "...", "variables": {...}, "operationName": "D"}`) untuk custom scan.
+- **"ended" di osnm-z = OpenSea bilang stage endTime < now** — tapi `endTime` di GraphQL kadang >1 tahun (e.g. `2027-08-12` untuk collection "ended"). Pola: cek `endTime` terbaru = urutkan descending, baru filter yang `now ∈ [startTime, endTime]`.
+- **User rule: free mint only** — kalo user minta "cari NFT free di X, mint 1x buat tes", **SELALU filter `eligiblePrice.unit == 0` atau on-chain `getPublicDrop.price == 0`** sebelum run `osnm-mint mint`. Jangan gaskan paid collection karena user revisi "Jangan mint nft yg paid ya".
+- **Keccak vs SHA3-256 (CRITICAL, found by MiniMax M3 review 2026-08-30)** — EVM selector/checksum/tx-hash pakai **Keccak-256**, BUKAN NIST SHA3. `hashlib.sha3_256` (Python) menghasilkan hash BERBEDA. Kalau lo bikin calldata/checksum manual: `from eth_hash.auto import keccak; keccak(sig.encode()).hex()`. `safe_mint.py` udah di-fix semua (sebelumnya `abi_encode_call`, `checksum_address`, `broadcast_same_raw` pakai sha3_256 → selector salah, tx-hash palsu, checksum invalid).
+
+## Robinhood Chain Spesifik — Funding, Gas, SOLD-OUT
+
+Lihat `references/robinhood-chain-pitfalls.md` untuk lesson lengkap dari
+live session 2026-08-25. Highlights:
+
+- **Gas limit ≥ 100k (bukan 21000)** untuk semua tx di RH chain —
+  `intrinsic gas too low` kalau pakai default ETH transfer. Submit harus
+  overestimate; node yang truncate berdasarkan actual gas_used.
+- **SOLD-OUT vs cross-drop wallet block** — error "exceeds allocation or
+  supply limit" bisa berarti `totalSupply == maxSupply` (drop habis),
+  BUKAN masalah wallet. Selalu probe `totalSupply()` on-chain sebelum
+  troubleshoot wallet. Scan pattern: `scripts/supply_scan.py` di
+  `~/nft-mint/` (port ke `scripts/` kalau mau share).
+- **`opensea-mint mint --fund` butuh EIP-7702** — TIDAK available di RH
+  chain. Funding wajib manual via `fund_fresh.py` (EIP-1559, gas 100k,
+  max_fee = base × 2). Sweep ke main wallet via `sweep.py`.
+- **osnm-z .env validator STRICT** — tolak unknown key (WALLET tanpa
+  _KEY), tolak duplicate key. Selalu sanitize .env sebelum dipakai CLI:
+  whitelist ke list di `src/config.rs` line 20-30, tambah default
+  `FEE_AUTOMATIC=true` + `GAS_LIMIT=100000`, cek no duplicate.
+- **Lost-wallet trap** — `opensea-mint wallets create` HARUS backup ke
+  path persisten sebelum transfer ETH. Kalau file hilang, ETH stuck
+  permanent. Pattern aman: `~/nft-mint/wallets/<slug>-<ts>.json` + log
+  timestamp.

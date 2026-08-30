@@ -111,6 +111,8 @@ pub enum NativeFundsError {
     WalletLimit { maximum: usize },
     #[error("native-currency arithmetic overflowed")]
     ArithmeticOverflow,
+    #[error("EIP-7702 delegation is not live on chain {rpc_chain_id}; --fund in Sponsored mode requires Prague/EIP-7702 support")]
+    Eip7702Unavailable { rpc_chain_id: u64 },
     #[error("funding payer must not also appear in WALLETS_FILE")]
     FundingPayerInManifest,
     #[error("wallet {0} has unsupported account code or delegation; undelegate it before funding")]
@@ -219,6 +221,18 @@ pub async fn fund(
     }
 
     let (gateway, chain, rpc_index) = connect(config).await?;
+    // M3: --fund in Sponsored mode pays for an EIP-7702 delegated launch. Refuse
+    // outright when the chain doesn't actually support live EIP-7702 (e.g.
+    // Robinhood's sequencer rejects eth_maxPriorityFeePerGas and has no
+    // Prague-style delegation) — otherwise we'd burn the sponsor's gas on txs
+    // that can never deploy the executor.
+    if let MultiWalletMode::Sponsored(_) = &multi.mode {
+        if !gateway.eip7702_is_live(&chain, rpc_index).await? {
+            return Err(NativeFundsError::Eip7702Unavailable {
+                rpc_chain_id: chain.chain_id,
+            });
+        }
+    }
     let funding_targets = load_funding_target_states(
         config,
         &gateway,

@@ -138,14 +138,16 @@ export async function localPublicSnipe(opts: LocalSnipeOpts): Promise<void> {
     accepted.map(async ({ idx, txHash }) => {
       const receipt = await waitForReceipt(txHash, rpcUrls[0], 60_000);
       if (!receipt) {
-        console.log(chalk.yellow(`  [W${idx}] TIMEOUT — check: ${explorerTx(chainId, txHash)}`));
+        const url = explorerTx(chainId, txHash);
+        console.log(chalk.yellow(`  [W${idx}] TIMEOUT — check: ${url ?? txHash}`));
         return;
       }
       const color = receipt.status === "SUCCESS" ? chalk.bold.green : chalk.bold.red;
       console.log(
         color(`  [W${idx}] Block: ${receipt.block} | Pos: ${receipt.position} | ${receipt.status} | Gas: ${receipt.gasUsed}`)
       );
-      console.log(chalk.gray(`  [W${idx}] Track: ${explorerTx(chainId, txHash)}`));
+      const track = explorerTx(chainId, txHash);
+      console.log(chalk.gray(`  [W${idx}] Track: ${track ?? txHash} (no explorer for chain ${chainId})`));
     })
   );
 
