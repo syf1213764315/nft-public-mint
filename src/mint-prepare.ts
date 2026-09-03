@@ -1,4 +1,4 @@
-import { JsonRpcProvider, Wallet, formatEther, getAddress, isAddress } from "ethers";
+import { JsonRpcProvider, formatEther, getAddress, isAddress } from "ethers";
 import { CHAINS, ChainProfile, resolveChain } from "./chains";
 import { parseNftLink } from "./nft-link";
 import { resolveSlug } from "./slug-resolver";
@@ -16,7 +16,7 @@ import { buildLocalMintPlan, LocalMintPlan } from "./seadrop-public";
 import { istTimeToDate, toIST } from "./time-format";
 
 export interface MintRequest {
-  keys: string[];
+  addresses: string[];
   chainKey: string;
   quantity: number;
   nftLink: string;
@@ -37,7 +37,6 @@ export interface PreparedWallet {
 }
 
 export interface PreparedMint {
-  walletKeys: string[];
   chain: ChainProfile;
   quantity: number;
   nftContract: string;
@@ -66,32 +65,25 @@ export class PrepareError extends Error {
   }
 }
 
-export function parseWalletKeys(rawKeys: string[]): { keys: string[]; addresses: string[] } {
-  const keys: string[] = [];
+export function parseAddresses(rawAddresses: string[]): string[] {
   const addresses: string[] = [];
   const seen = new Set<string>();
 
-  for (const raw of rawKeys) {
-    const trimmed = (raw || "").trim();
-    if (!trimmed) continue;
-    const normalized = trimmed.startsWith("0x") ? trimmed : `0x${trimmed}`;
-    let wallet: Wallet;
-    try {
-      wallet = new Wallet(normalized);
-    } catch {
-      throw new PrepareError("Not a valid private key — check the hex and try again.");
+  for (const raw of rawAddresses) {
+    const normalized = normalizeAddress(String(raw || ""));
+    if (!normalized) {
+      throw new PrepareError(`"${raw}" is not a 20-byte address.`);
     }
-    const addr = wallet.address.toLowerCase();
-    if (seen.has(addr)) continue;
-    seen.add(addr);
-    keys.push(normalized);
-    addresses.push(wallet.address);
+    const key = normalized.address.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    addresses.push(normalized.address);
   }
 
-  if (keys.length === 0) {
-    throw new PrepareError("Need at least one private key.");
+  if (addresses.length === 0) {
+    throw new PrepareError("Need at least one wallet address. Keys are parsed in the browser and never sent here.");
   }
-  return { keys, addresses };
+  return addresses;
 }
 
 export function normalizeAddress(
@@ -248,7 +240,7 @@ function resolveTiming(
 
 export async function prepareMint(req: MintRequest): Promise<PreparedMint> {
   const warnings: string[] = [];
-  const { keys: walletKeys } = parseWalletKeys(req.keys);
+  const addresses = parseAddresses(req.addresses || []);
 
   const quantity = Math.floor(Number(req.quantity));
   if (!Number.isFinite(quantity) || quantity < 1 || quantity > 100) {
@@ -349,17 +341,16 @@ export async function prepareMint(req: MintRequest): Promise<PreparedMint> {
   const timing = resolveTiming(req.timing || "wait", req.customTime, drop.startTime);
   warnings.push(...timing.warnings);
 
-  const wallets = walletKeys.map((k) => new Wallet(k));
   const balances = await Promise.all(
-    wallets.map((w) => provider.getBalance(w.address).catch(() => null))
+    addresses.map((address) => provider.getBalance(address).catch(() => null))
   );
   const required = BigInt(gasLimit) * maxFeePerGas + mintPlan.value;
 
-  const preparedWallets: PreparedWallet[] = wallets.map((w, i) => {
+  const preparedWallets: PreparedWallet[] = addresses.map((address, i) => {
     const bal = balances[i];
     return {
       index: i,
-      address: w.address,
+      address,
       balanceEth: bal === null ? null : Number(formatEther(bal)).toFixed(6),
       funded: bal === null ? true : bal >= required,
     };
@@ -375,7 +366,7 @@ export async function prepareMint(req: MintRequest): Promise<PreparedMint> {
 
   let canFire = true;
   let blockReason: string | undefined;
-  if (shortCount === wallets.length) {
+  if (shortCount === addresses.length) {
     canFire = false;
     blockReason = "Every wallet is underfunded — nothing could be broadcast.";
   }
@@ -385,7 +376,6 @@ export async function prepareMint(req: MintRequest): Promise<PreparedMint> {
   }
 
   return {
-    walletKeys,
     chain,
     quantity,
     nftContract: target.contract,
@@ -430,8 +420,16 @@ export function serializePreview(prepared: PreparedMint) {
     label: prepared.label,
     quantity: prepared.quantity,
     totalMints: prepared.quantity * prepared.wallets.length,
+    tx: {
+      to: prepared.mintPlan.to,
+      data: prepared.mintPlan.data,
+      valueWei: prepared.mintPlan.value.toString(),
+      chainId: prepared.chain.chainId,
+      type: 2,
+    },
     rpcs: parseRpcEndpoints(prepared.rpcUrls).map((ep, i) => ({
       label: ep.label,
+      url: ep.url,
       masked: maskRpc(ep.url),
       role: prepared.rpcPlan.sendOnly.includes(ep.url)
         ? "send"
@@ -478,6 +476,7 @@ export function chainCatalog() {
     chainId: c.chainId,
     symbol: c.nativeSymbol,
     alchemyHost: c.rpc.alchemyHost ?? null,
+    publicRpcs: c.rpc.public,
     hasEnvRpc: privateRpcsFromEnv(c.key).length > 0,
   }));
 }

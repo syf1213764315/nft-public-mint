@@ -7,7 +7,7 @@
     "nft-public-mint": "dist/index.js"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && mkdir -p web/vendor && cp node_modules/ethers/dist/ethers.umd.min.js web/vendor/ethers.umd.min.js",
     "start": "node dist/index.js",
     "dev": "ts-node src/index.ts",
     "web": "tsc && node dist/web-server.js"

@@ -15,7 +15,7 @@ wallets*.json
 osnm-z/wallets*.json
 osnm-z/*.session
 
-# os
+web/vendor/*.min.js
 .DS_Store
 *.log
 __pycache__/

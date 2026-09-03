@@ -132,10 +132,10 @@
         <div class="reticle" aria-hidden="true"></div>
         <div>
           <h1>SeaDrop 狙击台</h1>
-          <div class="sub">把 CLI 公开铸造流程放到本机网页里：链上组交易、预签名、多 RPC 齐射。</div>
+          <div class="sub">公开网页抢购台：链上组交易、浏览器内预签名、多 RPC 齐射。私钥不会离开你的设备。</div>
         </div>
       </div>
-      <div class="secure">LOCALHOST ONLY · KEYS IN RAM</div>
+      <div class="secure">KEYS STAY IN BROWSER · PUBLIC SITE</div>
     </header>
 
     <div class="grid">
@@ -143,7 +143,7 @@
         <h2>01 钱包</h2>
         <label for="keys">私钥（一行一个，输入会被遮盖，不会写入磁盘）</label>
         <textarea id="keys" class="keybox" placeholder="0x…" autocomplete="off" spellcheck="false"></textarea>
-        <div class="hint">只粘贴热钱包。服务绑定 127.0.0.1，私钥只在本次进程内存中用于签名。</div>
+        <div class="hint">只粘贴热钱包。私钥在浏览器里解析和签名，请求里只发送地址和已签名的 raw tx，不会上传私钥。</div>
         <div class="actions">
           <button type="button" class="ghost" id="parseKeys">识别地址</button>
         </div>
@@ -214,7 +214,7 @@
   <div class="modal" id="confirmModal">
     <div class="card">
       <h2>确认发射</h2>
-      <p id="confirmText" class="hint">预签名后会在设定时间把交易打到全部 RPC。此操作会花费钱包里的 gas（以及非免费 mint 的价格）。</p>
+      <p id="confirmText" class="hint">预签名在浏览器完成，然后把已签名交易打到全部 RPC。私钥不会上传。签名后交易不可撤回。</p>
       <div class="actions">
         <button type="button" class="ghost" id="cancelFire">取消</button>
         <button type="button" class="danger" id="confirmFire">确认发射</button>
@@ -222,17 +222,38 @@
     </div>
   </div>
 
+  <script src="/vendor/ethers.umd.min.js"></script>
   <script>
     const $ = (id) => document.getElementById(id);
-    const state = { preview: null, firing: false, abort: null, _waitLogged: false };
+    const state = { preview: null, firing: false, wallets: [] };
 
     function keysFromBox() {
       return $("keys").value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
     }
 
-    function payload() {
+    function walletsFromBox() {
+      const wallets = [];
+      const seen = new Set();
+      for (const raw of keysFromBox()) {
+        const normalized = raw.startsWith("0x") ? raw : `0x${raw}`;
+        let wallet;
+        try {
+          wallet = new ethers.Wallet(normalized);
+        } catch {
+          throw new Error("不是有效私钥，请检查十六进制格式。");
+        }
+        const key = wallet.address.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        wallets.push({ wallet, address: wallet.address });
+      }
+      if (!wallets.length) throw new Error("至少需要一把私钥。");
+      return wallets;
+    }
+
+    function previewPayload(addresses) {
       return {
-        keys: keysFromBox(),
+        addresses,
         chainKey: $("chain").value,
         quantity: Number($("quantity").value || 1),
         nftLink: $("nft").value.trim(),
@@ -256,6 +277,10 @@
       el.scrollTop = el.scrollHeight;
     }
 
+    function sleep(ms) {
+      return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
     async function api(path, body) {
       const res = await fetch(path, {
         method: body ? "POST" : "GET",
@@ -267,21 +292,29 @@
       return data;
     }
 
+    async function rpcCall(url, method, params) {
+      const data = await api("/api/rpc", { url, method, params });
+      const json = data.result;
+      if (json && json.error) throw new Error(json.error.message || "RPC error");
+      return json ? json.result : undefined;
+    }
+
     async function loadChains() {
       const data = await api("/api/chains");
       $("chain").innerHTML = data.chains.map((c) =>
-        `<option value="${c.key}">${c.name} · ${c.chainId}${c.hasEnvRpc ? " · .env RPC" : ""}</option>`
+        `<option value="${c.key}">${c.name} · ${c.chainId}</option>`
       ).join("");
       $("chain").value = "base";
     }
 
-    $("parseKeys").onclick = async () => {
+    $("parseKeys").onclick = () => {
       try {
-        const data = await api("/api/wallets", { keys: keysFromBox() });
-        $("walletChips").innerHTML = data.wallets.map((w) =>
-          `<span class="chip">W${w.index} ${w.address}</span>`
+        const wallets = walletsFromBox();
+        state.wallets = wallets;
+        $("walletChips").innerHTML = wallets.map((w, i) =>
+          `<span class="chip">W${i} ${w.address}</span>`
         ).join("");
-        logLine("ok", `已载入 ${data.wallets.length} 个钱包地址`);
+        logLine("ok", `已在浏览器内识别 ${wallets.length} 个地址（私钥未上传）`);
       } catch (err) {
         $("walletChips").innerHTML = `<span class="chip bad">${err.message}</span>`;
         logLine("err", err.message);
@@ -334,9 +367,14 @@
     $("previewBtn").onclick = async () => {
       $("previewBtn").disabled = true;
       try {
-        const p = await api("/api/preview", payload());
+        const wallets = walletsFromBox();
+        state.wallets = wallets;
+        $("walletChips").innerHTML = wallets.map((w, i) =>
+          `<span class="chip">W${i} ${w.address}</span>`
+        ).join("");
+        const p = await api("/api/preview", previewPayload(wallets.map((w) => w.address)));
         renderPreview(p);
-        logLine("ok", "链上 drop 已读取，尚未广播");
+        logLine("ok", "链上 drop 已读取。请求只带了地址，没有私钥。");
       } catch (err) {
         state.preview = null;
         $("fireBtn").disabled = true;
@@ -350,7 +388,7 @@
     $("fireBtn").onclick = () => {
       if (!state.preview?.canFire) return;
       $("confirmText").textContent =
-        `将用 ${state.preview.wallets.length} 个钱包铸造 ${state.preview.totalMints} 枚，时机：${state.preview.timing.label}。私钥不会写盘，但签名后交易不可撤回。`;
+        `将用 ${state.preview.wallets.length} 个钱包铸造 ${state.preview.totalMints} 枚，时机：${state.preview.timing.label}。私钥只在浏览器签名，不会上传到网站服务器。`;
       $("confirmModal").classList.add("open");
     };
     $("cancelFire").onclick = () => $("confirmModal").classList.remove("open");
@@ -359,33 +397,79 @@
       $("confirmModal").classList.remove("open");
       $("fireBtn").disabled = true;
       state.firing = true;
-      state._waitLogged = false;
-      logLine("warn", "开始预签名 / 等待 stage / 齐射");
+      logLine("warn", "浏览器内预签名 → 等待 stage → 齐射已签名交易");
       try {
-        const res = await fetch("/api/mint", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload()),
-        });
-        if (!res.ok) {
-          const data = await res.json().catch(() => ({ error: res.statusText }));
-          throw new Error(data.error || res.statusText);
+        const wallets = walletsFromBox();
+        const p = state.preview;
+        const rpcUrls = p.rpcs.map((r) => r.url);
+        const readUrl = (p.rpcs.find((r) => r.role === "read") || p.rpcs[0]).url;
+
+        logLine("info", "预热 RPC");
+        await Promise.all(rpcUrls.map((url) =>
+          api("/api/rpc", { url, method: "eth_sendRawTransaction", params: ["0x00"] }).catch(() => {})
+        ));
+
+        const nonces = await Promise.all(
+          wallets.map((w) => rpcCall(readUrl, "eth_getTransactionCount", [w.address, "pending"]))
+        );
+
+        const rawTxs = [];
+        const t0 = performance.now();
+        for (let i = 0; i < wallets.length; i++) {
+          const raw = await wallets[i].wallet.signTransaction({
+            to: p.tx.to,
+            data: p.tx.data,
+            value: BigInt(p.tx.valueWei),
+            nonce: Number(nonces[i]),
+            maxFeePerGas: ethers.parseUnits(String(p.gas.maxFeeGwei), "gwei"),
+            maxPriorityFeePerGas: ethers.parseUnits(String(p.gas.priorityGwei), "gwei"),
+            gasLimit: p.gas.gasLimit,
+            chainId: p.tx.chainId,
+            type: 2,
+          });
+          rawTxs.push(raw);
         }
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder();
-        let buf = "";
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          buf += decoder.decode(value, { stream: true });
-          const lines = buf.split("\n");
-          buf = lines.pop() || "";
-          for (const line of lines) {
-            if (!line.trim()) continue;
-            handleEvent(JSON.parse(line));
+        logLine("ok", `已在浏览器预签名 ${rawTxs.length} 笔（${(performance.now() - t0).toFixed(1)}ms）`);
+
+        if (p.timing.fireAt) {
+          const ts = Date.parse(p.timing.fireAt);
+          logLine("info", "已预签名，正在等待 stage 打开。请保持这个标签页开着。");
+          while (Date.now() < ts) {
+            startCountdown(ts);
+            await sleep(Math.min(250, Math.max(0, ts - Date.now())));
           }
         }
-        if (buf.trim()) handleEvent(JSON.parse(buf));
+
+        $("countdown").textContent = "FIRE";
+        logLine("warn", "齐射中");
+        const blast = await api("/api/blast", { rpcUrls, rawTxs });
+        logLine("ok", `派出 ${blast.wallets.length} 笔 · accepted ${blast.accepted} / rejected ${blast.rejected}`);
+
+        for (const w of blast.wallets) {
+          const explorer = `${p.chain.explorer}/tx/${w.txHash}`;
+          if (!w.accepted) {
+            const reasons = [...new Set((w.results || []).map((r) => r.message))];
+            logLine("err", `W${w.idx} 全部 RPC 拒绝：${reasons.join(" | ")}`);
+            continue;
+          }
+          logLine("info", `W${w.idx} ${w.txHash}`);
+          const started = Date.now();
+          let receipt = null;
+          while (Date.now() - started < 60_000) {
+            try {
+              receipt = await rpcCall(readUrl, "eth_getTransactionReceipt", [w.txHash]);
+              if (receipt) break;
+            } catch {}
+            await sleep(500);
+          }
+          if (!receipt) {
+            logLine("warn", `W${w.idx} TIMEOUT ${explorer}`);
+          } else {
+            const status = receipt.status === "0x1" ? "SUCCESS" : "REVERTED";
+            logLine(status === "SUCCESS" ? "ok" : "err", `W${w.idx} ${status} ${explorer}`);
+          }
+        }
+        logLine("ok", "发射流程结束");
       } catch (err) {
         logLine("err", err.message);
       } finally {
@@ -394,50 +478,8 @@
       }
     };
 
-    function handleEvent(ev) {
-      switch (ev.type) {
-        case "log":
-          logLine(ev.level, ev.message); break;
-        case "warming":
-          logLine("info", "正在预热 RPC 连接"); break;
-        case "warmed":
-          logLine("ok", "RPC 连接已预热"); break;
-        case "signed":
-          logLine("ok", `已预签名 ${ev.count} 笔交易（${ev.ms}ms, chain ${ev.chainId}）`); break;
-        case "waiting":
-          startCountdown(Date.now() + ev.remainingMs);
-          if (!state._waitLogged) {
-            state._waitLogged = true;
-            logLine("info", "已预签名，正在等待 stage 打开");
-          }
-          break;
-        case "firing":
-          $("countdown").textContent = "FIRE";
-          logLine("warn", "齐射中"); break;
-        case "dispatched":
-          logLine("ok", `已派出 ${ev.wallets.length} 笔 · ${ev.dispatchMs}ms · stage+${ev.sinceStageMs}ms`);
-          ev.wallets.forEach((w) => logLine("info", `W${w.idx} ${w.txHash}`));
-          break;
-        case "rpc":
-          logLine(ev.ok ? "ok" : "warn", `W${ev.walletIdx} ${ev.label}: ${ev.message}`); break;
-        case "rejected":
-          logLine("err", `W${ev.idx} 全部 RPC 拒绝：${(ev.reasons || []).join(" | ")}`); break;
-        case "receipt":
-          logLine(ev.status === "SUCCESS" ? "ok" : "err",
-            `W${ev.idx} ${ev.status}${ev.block ? " block " + ev.block : ""} ${ev.explorer || ev.txHash}`);
-          break;
-        case "complete":
-          logLine("ok", `完成：accepted ${ev.accepted} / rejected ${ev.rejected} / dispatched ${ev.dispatched}`);
-          break;
-        case "error":
-          logLine("err", ev.message); break;
-        default:
-          logLine("info", JSON.stringify(ev));
-      }
-    }
-
     loadChains().catch((err) => logLine("err", err.message));
-    logLine("info", "控制台已就绪。私钥只发往本机 127.0.0.1。");
+    logLine("info", "控制台已就绪。私钥只在浏览器中使用，不会发到 Netlify。");
   </script>
 </body>
 </html>
