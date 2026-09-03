@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SeaDrop 狙击台</title>
+  <style>
+    :root {
+      --bg: #090b0a;
+      --bg-2: #101412;
+      --panel: #141816;
+      --line: rgba(210, 255, 92, 0.14);
+      --line-strong: rgba(210, 255, 92, 0.35);
+      --ink: #e8f0df;
+      --muted: #8b9680;
+      --lime: #d2ff5c;
+      --lime-dim: #9dbe3a;
+      --warn: #ffbf47;
+      --bad: #ff5a4a;
+      --ok: #5dff9f;
+      --shadow: 0 24px 80px rgba(0, 0, 0, 0.45);
+      --mono: "IBM Plex Mono", "ui-monospace", "SFMono-Regular", Menlo, Consolas, monospace;
+      --sans: "Sora", "PingFang SC", "Noto Sans SC", "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; min-height: 100%; background: var(--bg); color: var(--ink); font-family: var(--sans); }
+    body {
+      background-image:
+        radial-gradient(1200px 500px at 10% -10%, rgba(210, 255, 92, 0.08), transparent 55%),
+        radial-gradient(900px 400px at 100% 0%, rgba(255, 90, 74, 0.08), transparent 50%),
+        linear-gradient(rgba(210, 255, 92, 0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(210, 255, 92, 0.03) 1px, transparent 1px);
+      background-size: auto, auto, 48px 48px, 48px 48px;
+    }
+    .wrap { max-width: 1280px; margin: 0 auto; padding: 28px 20px 80px; }
+    header.top {
+      display: flex; justify-content: space-between; gap: 16px; align-items: flex-end;
+      border-bottom: 1px solid var(--line); padding-bottom: 18px; margin-bottom: 22px;
+    }
+    .brand { display: flex; gap: 14px; align-items: center; }
+    .reticle {
+      width: 42px; height: 42px; border: 1px solid var(--lime); position: relative;
+      box-shadow: 0 0 24px rgba(210, 255, 92, 0.25);
+    }
+    .reticle::before, .reticle::after {
+      content: ""; position: absolute; background: var(--lime);
+    }
+    .reticle::before { width: 1px; height: 18px; left: 50%; top: 12px; transform: translateX(-50%); }
+    .reticle::after { height: 1px; width: 18px; top: 50%; left: 12px; transform: translateY(-50%); }
+    h1 { font-size: 22px; letter-spacing: 0.16em; text-transform: uppercase; margin: 0 0 4px; }
+    .sub { color: var(--muted); font-size: 13px; }
+    .secure {
+      font-family: var(--mono); font-size: 11px; color: var(--lime);
+      border: 1px solid var(--line-strong); padding: 8px 12px; letter-spacing: 0.08em;
+      background: rgba(210, 255, 92, 0.06);
+    }
+    .grid { display: grid; grid-template-columns: 1.15fr 0.85fr; gap: 18px; }
+    @media (max-width: 980px) { .grid { grid-template-columns: 1fr; } }
+    .card {
+      background: linear-gradient(180deg, rgba(255,255,255,0.02), transparent 40%), var(--panel);
+      border: 1px solid var(--line); box-shadow: var(--shadow); padding: 18px;
+    }
+    .card h2 {
+      margin: 0 0 14px; font-size: 12px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--lime-dim);
+    }
+    label { display: block; font-size: 12px; color: var(--muted); margin: 12px 0 6px; letter-spacing: 0.04em; }
+    input, select, textarea, button {
+      font: inherit; color: var(--ink); background: var(--bg-2); border: 1px solid var(--line);
+    }
+    input, select, textarea {
+      width: 100%; padding: 10px 12px; outline: none;
+    }
+    input:focus, select:focus, textarea:focus { border-color: var(--lime); }
+    textarea.keybox {
+      font-family: var(--mono); min-height: 92px; letter-spacing: 0.04em;
+      -webkit-text-security: disc;
+    }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .row3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+    @media (max-width: 720px) { .row, .row3 { grid-template-columns: 1fr; } }
+    .chips { display: flex; flex-wrap: wrap; gap: 8px; min-height: 28px; }
+    .chip {
+      font-family: var(--mono); font-size: 12px; padding: 6px 8px; border: 1px solid var(--line);
+      background: rgba(210, 255, 92, 0.05);
+    }
+    .chip.bad { border-color: rgba(255, 90, 74, 0.5); color: var(--bad); }
+    .hint { color: var(--muted); font-size: 12px; margin-top: 6px; line-height: 1.5; }
+    .actions { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
+    button {
+      cursor: pointer; padding: 11px 16px; letter-spacing: 0.12em; text-transform: uppercase; font-size: 12px;
+    }
+    button.primary { background: var(--lime); color: #111; border-color: var(--lime); font-weight: 700; }
+    button.primary:disabled { opacity: 0.4; cursor: not-allowed; }
+    button.ghost:hover, button.danger:hover { border-color: var(--ink); }
+    button.danger { background: var(--bad); color: #140404; border-color: var(--bad); font-weight: 700; }
+    button.danger:disabled { opacity: 0.35; cursor: not-allowed; }
+    .check { display: flex; gap: 8px; align-items: center; margin-top: 12px; font-size: 13px; color: var(--muted); }
+    .check input { width: auto; }
+    .status {
+      font-family: var(--mono); font-size: 12px; line-height: 1.65; background: #070908;
+      border: 1px solid var(--line); padding: 12px; min-height: 280px; max-height: 420px; overflow: auto;
+      white-space: pre-wrap; word-break: break-word;
+    }
+    .status .ok { color: var(--ok); }
+    .status .warn { color: var(--warn); }
+    .status .err { color: var(--bad); }
+    .status .info { color: var(--muted); }
+    .kv { display: grid; grid-template-columns: 92px 1fr; gap: 6px 10px; font-size: 13px; }
+    .kv b { color: var(--muted); font-weight: 500; }
+    .kv span { font-family: var(--mono); word-break: break-all; }
+    .banner {
+      padding: 10px 12px; margin-bottom: 12px; border: 1px solid var(--line); font-size: 13px;
+    }
+    .banner.warn { border-color: rgba(255, 191, 71, 0.4); color: var(--warn); }
+    .banner.bad { border-color: rgba(255, 90, 74, 0.45); color: var(--bad); }
+    .banner.ok { border-color: rgba(93, 255, 159, 0.4); color: var(--ok); }
+    .count {
+      font-family: var(--mono); font-size: 28px; color: var(--lime); letter-spacing: 0.08em; margin: 8px 0 14px;
+    }
+    .modal {
+      position: fixed; inset: 0; background: rgba(0,0,0,0.72); display: none; place-items: center; padding: 20px; z-index: 20;
+    }
+    .modal.open { display: grid; }
+    .modal .card { max-width: 460px; width: 100%; }
+    a { color: var(--lime); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header class="top">
+      <div class="brand">
+        <div class="reticle" aria-hidden="true"></div>
+        <div>
+          <h1>SeaDrop 狙击台</h1>
+          <div class="sub">公开网页抢购台：链上组交易、浏览器内预签名、多 RPC 齐射。私钥不会离开你的设备。</div>
+        </div>
+      </div>
+      <div class="secure">KEYS STAY IN BROWSER · PUBLIC SITE</div>
+    </header>
+
+    <div class="grid">
+      <section class="card">
+        <h2>01 钱包</h2>
+        <label for="keys">私钥（一行一个，输入会被遮盖，不会写入磁盘）</label>
+        <textarea id="keys" class="keybox" placeholder="0x…" autocomplete="off" spellcheck="false"></textarea>
+        <div class="hint">只粘贴热钱包。私钥在浏览器里解析和签名，请求里只发送地址和已签名的 raw tx，不会上传私钥。</div>
+        <div class="actions">
+          <button type="button" class="ghost" id="parseKeys">识别地址</button>
+        </div>
+        <div class="chips" id="walletChips"></div>
+
+        <h2 style="margin-top:22px">02 目标</h2>
+        <div class="row">
+          <div>
+            <label for="chain">链</label>
+            <select id="chain"></select>
+          </div>
+          <div>
+            <label for="quantity">每钱包数量</label>
+            <input id="quantity" type="number" min="1" max="100" value="1" />
+          </div>
+        </div>
+        <label for="nft">OpenSea 链接 / slug / 合约地址</label>
+        <input id="nft" placeholder="https://opensea.io/collection/… 或 0x…" />
+
+        <h2 style="margin-top:22px">03 网络与 Gas</h2>
+        <label for="rpc">RPC（完整 URL，或 Alchemy key；留空则用 .env / 公共节点）</label>
+        <input id="rpc" placeholder="https://… 或 Alchemy key" />
+        <div class="row3">
+          <div>
+            <label for="maxFee">Max fee (gwei)</label>
+            <input id="maxFee" type="number" min="0" step="0.001" placeholder="自动" />
+          </div>
+          <div>
+            <label for="tip">Tip (gwei)</label>
+            <input id="tip" type="number" min="0" step="0.001" placeholder="自动" />
+          </div>
+          <div>
+            <label for="gasLimit">Gas limit</label>
+            <input id="gasLimit" type="number" min="21000" max="5000000" placeholder="250000" />
+          </div>
+        </div>
+        <div class="row">
+          <div>
+            <label for="timing">发射时机</label>
+            <select id="timing">
+              <option value="wait">等到 stage 打开（预签名）</option>
+              <option value="now">立即发射</option>
+              <option value="custom">自定义 IST 时间</option>
+            </select>
+          </div>
+          <div>
+            <label for="customTime">自定义 HH:MM（IST）</label>
+            <input id="customTime" placeholder="21:05" />
+          </div>
+        </div>
+        <label class="check"><input type="checkbox" id="continueRpc" /> 无法验证 chain id 时仍继续</label>
+        <div class="actions">
+          <button type="button" class="primary" id="previewBtn">读取链上 drop</button>
+          <button type="button" class="danger" id="fireBtn" disabled>发射</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>04 瞄准镜</h2>
+        <div id="previewBox"><div class="hint">先识别钱包并读取 drop。不会广播任何交易。</div></div>
+        <div class="count" id="countdown">--:--:--</div>
+        <h2>05 发射日志</h2>
+        <div class="status" id="log"></div>
+      </section>
+    </div>
+  </div>
+
+  <div class="modal" id="confirmModal">
+    <div class="card">
+      <h2>确认发射</h2>
+      <p id="confirmText" class="hint">预签名在浏览器完成，然后把已签名交易打到全部 RPC。私钥不会上传。签名后交易不可撤回。</p>
+      <div class="actions">
+        <button type="button" class="ghost" id="cancelFire">取消</button>
+        <button type="button" class="danger" id="confirmFire">确认发射</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/vendor/ethers.umd.min.js"></script>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const state = { preview: null, firing: false, wallets: [] };
+
+    function keysFromBox() {
+      return $("keys").value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+    }
+
+    function walletsFromBox() {
+      const wallets = [];
+      const seen = new Set();
+      for (const raw of keysFromBox()) {
+        const normalized = raw.startsWith("0x") ? raw : `0x${raw}`;
+        let wallet;
+        try {
+          wallet = new ethers.Wallet(normalized);
+        } catch {
+          throw new Error("不是有效私钥，请检查十六进制格式。");
+        }
+        const key = wallet.address.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        wallets.push({ wallet, address: wallet.address });
+      }
+      if (!wallets.length) throw new Error("至少需要一把私钥。");
+      return wallets;
+    }
+
+    function previewPayload(addresses) {
+      return {
+        addresses,
+        chainKey: $("chain").value,
+        quantity: Number($("quantity").value || 1),
+        nftLink: $("nft").value.trim(),
+        rpc: $("rpc").value.trim(),
+        maxFeeGwei: $("maxFee").value === "" ? undefined : Number($("maxFee").value),
+        priorityGwei: $("tip").value === "" ? undefined : Number($("tip").value),
+        gasLimit: $("gasLimit").value === "" ? undefined : Number($("gasLimit").value),
+        timing: $("timing").value,
+        customTime: $("customTime").value.trim(),
+        continueUnverifiedRpc: $("continueRpc").checked,
+      };
+    }
+
+    function logLine(level, message) {
+      const el = $("log");
+      const time = new Date().toISOString().slice(11, 23);
+      const div = document.createElement("div");
+      div.className = level;
+      div.textContent = `[${time}] ${message}`;
+      el.appendChild(div);
+      el.scrollTop = el.scrollHeight;
+    }
+
+    function sleep(ms) {
+      return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    async function api(path, body) {
+      const res = await fetch(path, {
+        method: body ? "POST" : "GET",
+        headers: body ? { "Content-Type": "application/json" } : undefined,
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      const data = await res.json();
+      if (!res.ok || data.ok === false) throw new Error(data.error || res.statusText);
+      return data;
+    }
+
+    async function rpcCall(url, method, params) {
+      const data = await api("/api/rpc", { url, method, params });
+      const json = data.result;
+      if (json && json.error) throw new Error(json.error.message || "RPC error");
+      return json ? json.result : undefined;
+    }
+
+    async function loadChains() {
+      const data = await api("/api/chains");
+      $("chain").innerHTML = data.chains.map((c) =>
+        `<option value="${c.key}">${c.name} · ${c.chainId}</option>`
+      ).join("");
+      $("chain").value = "base";
+    }
+
+    $("parseKeys").onclick = () => {
+      try {
+        const wallets = walletsFromBox();
+        state.wallets = wallets;
+        $("walletChips").innerHTML = wallets.map((w, i) =>
+          `<span class="chip">W${i} ${w.address}</span>`
+        ).join("");
+        logLine("ok", `已在浏览器内识别 ${wallets.length} 个地址（私钥未上传）`);
+      } catch (err) {
+        $("walletChips").innerHTML = `<span class="chip bad">${err.message}</span>`;
+        logLine("err", err.message);
+      }
+    };
+
+    function renderPreview(p) {
+      state.preview = p;
+      const warns = (p.warnings || []).map((w) => `<div class="banner warn">${w}</div>`).join("");
+      const block = p.canFire ? "" : `<div class="banner bad">${p.blockReason || "当前不能发射"}</div>`;
+      const wallets = p.wallets.map((w) =>
+        `<span class="chip ${w.funded ? "" : "bad"}">W${w.index} ${w.address.slice(0,6)}…${w.address.slice(-4)} · ${w.balanceEth ?? "?"} ${p.chain.symbol}</span>`
+      ).join("");
+      $("previewBox").innerHTML = `
+        ${block}${warns}
+        <div class="kv">
+          <b>目标</b><span>${p.label} · ${p.contract}</span>
+          <b>链</b><span>${p.chain.name} (${p.chain.chainId})</span>
+          <b>价格</b><span>${p.drop.pricePerNft} × ${p.quantity} = ${p.drop.valuePerWallet} / 钱包</span>
+          <b>窗口</b><span>${p.drop.windowIst}${p.drop.live ? " · LIVE" : ""}</span>
+          <b>Fee</b><span>${p.drop.feeRecipient}</span>
+          <b>RPC</b><span>${p.rpcs.map((r) => r.label + "/" + r.role).join(", ")}</span>
+          <b>Gas</b><span>base ${p.gas.baseFeeGwei ?? "?"} · max ${p.gas.maxFeeGwei} · tip ${p.gas.priorityGwei} · limit ${p.gas.gasLimit}</span>
+          <b>预留</b><span>${p.gas.requiredEth} ${p.chain.symbol} / 钱包</span>
+          <b>时机</b><span>${p.timing.label}</span>
+        </div>
+        <div class="chips" style="margin-top:12px">${wallets}</div>
+      `;
+      $("fireBtn").disabled = !p.canFire;
+      if (p.timing.fireAt) startCountdown(Date.parse(p.timing.fireAt));
+      else $("countdown").textContent = p.drop.live ? "LIVE" : "--:--:--";
+    }
+
+    let countdownTimer = null;
+    function startCountdown(ts) {
+      clearInterval(countdownTimer);
+      const tick = () => {
+        const ms = ts - Date.now();
+        if (ms <= 0) { $("countdown").textContent = "FIRE"; return; }
+        const s = Math.floor(ms / 1000);
+        const hh = String(Math.floor(s / 3600)).padStart(2, "0");
+        const mm = String(Math.floor((s % 3600) / 60)).padStart(2, "0");
+        const ss = String(s % 60).padStart(2, "0");
+        $("countdown").textContent = `${hh}:${mm}:${ss}`;
+      };
+      tick();
+      countdownTimer = setInterval(tick, 250);
+    }
+
+    $("previewBtn").onclick = async () => {
+      $("previewBtn").disabled = true;
+      try {
+        const wallets = walletsFromBox();
+        state.wallets = wallets;
+        $("walletChips").innerHTML = wallets.map((w, i) =>
+          `<span class="chip">W${i} ${w.address}</span>`
+        ).join("");
+        const p = await api("/api/preview", previewPayload(wallets.map((w) => w.address)));
+        renderPreview(p);
+        logLine("ok", "链上 drop 已读取。请求只带了地址，没有私钥。");
+      } catch (err) {
+        state.preview = null;
+        $("fireBtn").disabled = true;
+        $("previewBox").innerHTML = `<div class="banner bad">${err.message}</div>`;
+        logLine("err", err.message);
+      } finally {
+        $("previewBtn").disabled = false;
+      }
+    };
+
+    $("fireBtn").onclick = () => {
+      if (!state.preview?.canFire) return;
+      $("confirmText").textContent =
+        `将用 ${state.preview.wallets.length} 个钱包铸造 ${state.preview.totalMints} 枚，时机：${state.preview.timing.label}。私钥只在浏览器签名，不会上传到网站服务器。`;
+      $("confirmModal").classList.add("open");
+    };
+    $("cancelFire").onclick = () => $("confirmModal").classList.remove("open");
+
+    $("confirmFire").onclick = async () => {
+      $("confirmModal").classList.remove("open");
+      $("fireBtn").disabled = true;
+      state.firing = true;
+      logLine("warn", "浏览器内预签名 → 等待 stage → 齐射已签名交易");
+      try {
+        const wallets = walletsFromBox();
+        const p = state.preview;
+        const rpcUrls = p.rpcs.map((r) => r.url);
+        const readUrl = (p.rpcs.find((r) => r.role === "read") || p.rpcs[0]).url;
+
+        logLine("info", "预热 RPC");
+        await Promise.all(rpcUrls.map((url) =>
+          api("/api/rpc", { url, method: "eth_sendRawTransaction", params: ["0x00"] }).catch(() => {})
+        ));
+
+        const nonces = await Promise.all(
+          wallets.map((w) => rpcCall(readUrl, "eth_getTransactionCount", [w.address, "pending"]))
+        );
+
+        const rawTxs = [];
+        const t0 = performance.now();
+        for (let i = 0; i < wallets.length; i++) {
+          const raw = await wallets[i].wallet.signTransaction({
+            to: p.tx.to,
+            data: p.tx.data,
+            value: BigInt(p.tx.valueWei),
+            nonce: Number(nonces[i]),
+            maxFeePerGas: ethers.parseUnits(String(p.gas.maxFeeGwei), "gwei"),
+            maxPriorityFeePerGas: ethers.parseUnits(String(p.gas.priorityGwei), "gwei"),
+            gasLimit: p.gas.gasLimit,
+            chainId: p.tx.chainId,
+            type: 2,
+          });
+          rawTxs.push(raw);
+        }
+        logLine("ok", `已在浏览器预签名 ${rawTxs.length} 笔（${(performance.now() - t0).toFixed(1)}ms）`);
+
+        if (p.timing.fireAt) {
+          const ts = Date.parse(p.timing.fireAt);
+          logLine("info", "已预签名，正在等待 stage 打开。请保持这个标签页开着。");
+          while (Date.now() < ts) {
+            startCountdown(ts);
+            await sleep(Math.min(250, Math.max(0, ts - Date.now())));
+          }
+        }
+
+        $("countdown").textContent = "FIRE";
+        logLine("warn", "齐射中");
+        const blast = await api("/api/blast", { rpcUrls, rawTxs });
+        logLine("ok", `派出 ${blast.wallets.length} 笔 · accepted ${blast.accepted} / rejected ${blast.rejected}`);
+
+        for (const w of blast.wallets) {
+          const explorer = `${p.chain.explorer}/tx/${w.txHash}`;
+          if (!w.accepted) {
+            const reasons = [...new Set((w.results || []).map((r) => r.message))];
+            logLine("err", `W${w.idx} 全部 RPC 拒绝：${reasons.join(" | ")}`);
+            continue;
+          }
+          logLine("info", `W${w.idx} ${w.txHash}`);
+          const started = Date.now();
+          let receipt = null;
+          while (Date.now() - started < 60_000) {
+            try {
+              receipt = await rpcCall(readUrl, "eth_getTransactionReceipt", [w.txHash]);
+              if (receipt) break;
+            } catch {}
+            await sleep(500);
+          }
+          if (!receipt) {
+            logLine("warn", `W${w.idx} TIMEOUT ${explorer}`);
+          } else {
+            const status = receipt.status === "0x1" ? "SUCCESS" : "REVERTED";
+            logLine(status === "SUCCESS" ? "ok" : "err", `W${w.idx} ${status} ${explorer}`);
+          }
+        }
+        logLine("ok", "发射流程结束");
+      } catch (err) {
+        logLine("err", err.message);
+      } finally {
+        state.firing = false;
+        $("fireBtn").disabled = !state.preview?.canFire;
+      }
+    };
+
+    loadChains().catch((err) => logLine("err", err.message));
+    logLine("info", "控制台已就绪。私钥只在浏览器中使用，不会发到 Netlify。");
+  </script>
+</body>
+</html>

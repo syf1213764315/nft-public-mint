@@ -1,7 +1,24 @@
 import chalk from "chalk";
 import ora from "ora";
 
-export async function waitForMintTime(mintTime: Date, earlyFireMs: number = 0): Promise<void> {
+export interface WaitForMintTimeOpts {
+  onTick?: (remainingMs: number) => void;
+  signal?: AbortSignal;
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    const err = new Error("Aborted — mint wait cancelled");
+    err.name = "AbortError";
+    throw err;
+  }
+}
+
+export async function waitForMintTime(
+  mintTime: Date,
+  earlyFireMs: number = 0,
+  opts: WaitForMintTimeOpts = {}
+): Promise<void> {
   // Fire early by earlyFireMs — tx sits in mempool and lands the moment contract allows
   const fireTime = new Date(mintTime.getTime() - earlyFireMs);
   const now = new Date();
@@ -17,44 +34,82 @@ export async function waitForMintTime(mintTime: Date, earlyFireMs: number = 0): 
     console.log(chalk.bold.yellow(`  🔥 Early fire: ${earlyFireMs}ms before mint → firing at ${fireTime.toISOString()}`));
   }
   console.log(chalk.gray(`  Now: ${now.toISOString()} | Waiting ${Math.ceil(diff / 1000)}s...\n`));
+  opts.onTick?.(diff);
+
+  const useSpinner = !opts.onTick && Boolean(process.stdout.isTTY) && diff > 10000;
 
   // If more than 10 seconds away, show a countdown spinner
   if (diff > 10000) {
-    const spinner = ora({
-      text: formatCountdown(fireTime),
-      color: "cyan",
-    }).start();
+    const spinner = useSpinner
+      ? ora({
+          text: formatCountdown(fireTime),
+          color: "cyan",
+        }).start()
+      : null;
 
-    await new Promise<void>((resolve) => {
+    await new Promise<void>((resolve, reject) => {
       const interval = setInterval(() => {
+        try {
+          throwIfAborted(opts.signal);
+        } catch (err) {
+          clearInterval(interval);
+          spinner?.stop();
+          reject(err);
+          return;
+        }
         const remaining = fireTime.getTime() - Date.now();
+        opts.onTick?.(Math.max(0, remaining));
 
         if (remaining <= 5000) {
           clearInterval(interval);
-          spinner.stop();
+          spinner?.stop();
           resolve();
-        } else {
+        } else if (spinner) {
           spinner.text = formatCountdown(fireTime);
         }
       }, 500);
+
+      if (opts.signal) {
+        const onAbort = () => {
+          clearInterval(interval);
+          spinner?.stop();
+          const err = new Error("Aborted — mint wait cancelled");
+          err.name = "AbortError";
+          reject(err);
+        };
+        opts.signal.addEventListener("abort", onAbort, { once: true });
+      }
     });
   }
 
   // Precise wait for the last few seconds using a tight loop
+  throwIfAborted(opts.signal);
   const remaining = fireTime.getTime() - Date.now();
   if (remaining > 0) {
     if (remaining > 100) {
-      await new Promise((resolve) =>
-        setTimeout(resolve, remaining - 100)
-      );
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(resolve, remaining - 100);
+        if (!opts.signal) return;
+        opts.signal.addEventListener(
+          "abort",
+          () => {
+            clearTimeout(timer);
+            const err = new Error("Aborted — mint wait cancelled");
+            err.name = "AbortError";
+            reject(err);
+          },
+          { once: true }
+        );
+      });
     }
 
     // Tight spin-wait for the final milliseconds
     while (Date.now() < fireTime.getTime()) {
-      // Spin-wait — burns CPU but gives sub-ms precision
+      throwIfAborted(opts.signal);
     }
   }
 
+  opts.onTick?.(0);
   console.log(chalk.bold.green("  🟢 FIRING!\n"));
 }
 

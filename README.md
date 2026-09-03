@@ -171,12 +171,37 @@ code changes needed.
 
 ## Security
 
-- Private keys are pasted at run time, kept in memory, and **never written to
-  disk or transmitted anywhere** except as a locally-signed transaction.
+- CLI: private keys are pasted at run time, kept in memory, and **never written to
+  disk**.
+- Web / Netlify: keys are parsed and signed **in the browser**. The server only
+  sees wallet addresses and already-signed raw transactions — never private keys.
 - `.env`, `wallets/` and `*.key` are all git-ignored.
 - Use dedicated hot wallets funded with only what you intend to spend.
 - Read [`src/local-mint.ts`](src/local-mint.ts) if you want to verify exactly what
-  gets signed and sent — it's about 150 lines.
+  the CLI signs and sends.
+
+---
+
+## Web console / Netlify
+
+Local:
+
+```bash
+npm install
+npm run web
+```
+
+Open http://127.0.0.1:3847
+
+Public (Netlify, so anyone can open the page):
+
+1. Push this repo to GitHub.
+2. In [Netlify](https://app.netlify.com), **Add new site → Import an existing project**.
+3. Settings are in `netlify.toml` (`npm run build`, publish `web`).
+4. Deploy. The site URL is public.
+
+The public site does **not** hold anyone's keys. Each visitor signs in their own
+browser. Keep the tab open if you chose “wait for stage”.
 
 ---
 

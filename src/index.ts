@@ -17,6 +17,7 @@ NFT Public Mint Sniper
 
 Usage
   npm start              run the interactive wizard
+  npm run web            local / Netlify-style web console (browser signs)
   npm start -- --help    show this message
 
 Everything is asked interactively: keys, chain, quantity, NFT link, RPC,
